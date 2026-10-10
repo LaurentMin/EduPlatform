@@ -25,7 +25,7 @@ services:
     volumes:
       - ./garage-data:/var/lib/garage
       - ./garage.toml:/etc/garage.toml
-    command: server
+    command: /garage server
 
   # 3. Backend (Go + Hot-Reload)
   backend:

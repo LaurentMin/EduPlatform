@@ -1,0 +1,46 @@
+# ========================
+# OS & Éditeurs
+# ========================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# ========================
+# Infrastructure & Données
+# ========================
+# Ignore les données stockées localement par Garage S3
+garage-data/
+# Ignore les données PostgreSQL si tu passes sur un bind mount un jour
+pg-data/
+*.pem
+*.key
+.env
+
+# ========================
+# Backend (Go)
+# ========================
+# Dossier temporaire utilisé par Air pour le hot-reload
+/backend/tmp/
+# Binaires compilés
+/backend/calendar-chat-app
+/backend/*.exe
+/backend/*.out
+/backend/vendor/
+
+# ========================
+# Frontend (Next.js / Node)
+# ========================
+/frontend/node_modules/
+/frontend/.next/
+/frontend/out/
+/frontend/build
+# Fichiers d'environnement locaux (à ne jamais commiter)
+/frontend/.env.local
+/frontend/.env.development.local
+/frontend/.env.test.local
+/frontend/.env.production.local
+# Logs d'erreurs NPM
+/frontend/npm-debug.log*
+/frontend/yarn-debug.log*
+/frontend/yarn-error.log*
