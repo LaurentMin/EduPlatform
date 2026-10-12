@@ -13,115 +13,252 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
 	_ "github.com/lib/pq"
+	"golang.org/x/crypto/bcrypt"
 )
 
-// Configuration globale du WebSocket (placée à l'extérieur du main)
+// --- 1. CONFIGURATION ET MODÈLES ---
+
+var jwtKey = []byte("super_secret_key_pour_le_dev")
+
+type Credentials struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+type Claims struct {
+	UserID int    `json:"user_id"`
+	Email  string `json:"email"`
+	jwt.RegisteredClaims
+}
+
+type Message struct {
+	Sender    string `json:"sender"`
+	Content   string `json:"content"`
+	Type      string `json:"type"`
+	Timestamp string `json:"timestamp"`
+}
+
+type Client struct {
+	hub  *Hub
+	conn *websocket.Conn
+	send chan []byte
+}
+
+type Hub struct {
+	clients    map[*Client]bool
+	broadcast  chan []byte
+	register   chan *Client
+	unregister chan *Client
+}
+
+func newHub() *Hub {
+	return &Hub{
+		broadcast:  make(chan []byte),
+		register:   make(chan *Client),
+		unregister: make(chan *Client),
+		clients:    make(map[*Client]bool),
+	}
+}
+
+// --- 2. LOGIQUE WEBSOCKET (HUB) ---
+
+func (h *Hub) run() {
+	for {
+		select {
+		case client := <-h.register:
+			h.clients[client] = true
+			log.Printf("🔌 Client connecté. Total: %d", len(h.clients))
+		case client := <-h.unregister:
+			if _, ok := h.clients[client]; ok {
+				delete(h.clients, client)
+				close(client.send)
+				log.Printf("🔌 Client déconnecté. Total: %d", len(h.clients))
+			}
+		case message := <-h.broadcast:
+			for client := range h.clients {
+				select {
+				case client.send <- message:
+				default:
+					close(client.send)
+					delete(h.clients, client)
+				}
+			}
+		}
+	}
+}
+
+func (c *Client) readPump() {
+	defer func() {
+		c.hub.unregister <- c
+		c.conn.Close()
+	}()
+	for {
+		_, p, err := c.conn.ReadMessage()
+		if err != nil {
+			break
+		}
+		var msg Message
+		if err := json.Unmarshal(p, &msg); err == nil {
+			msg.Timestamp = time.Now().Format(time.RFC3339)
+			out, _ := json.Marshal(msg)
+			c.hub.broadcast <- out
+		}
+	}
+}
+
+func (c *Client) writePump() {
+	defer c.conn.Close()
+	for {
+		message, ok := <-c.send
+		if !ok {
+			c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+			return
+		}
+		c.conn.WriteMessage(websocket.TextMessage, message)
+	}
+}
+
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
-	// Autoriser toutes les origines en développement (Next.js sur le port 3000)
-	CheckOrigin: func(r *http.Request) bool {
-		return true
-	},
+	CheckOrigin:     func(r *http.Request) bool { return true },
+}
+
+// --- 3. SERVEUR HTTP ET ROUTES ---
+
+// Middleware pour autoriser le frontend (CORS)
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Autoriser Next.js
+		w.Header().Set("Access-Control-Allow-Origin", "http://localhost:3000")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
+		w.Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization")
+
+		// Les navigateurs envoient une requête OPTIONS avant le POST. On doit dire "OK".
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
 }
 
 func main() {
-	log.Println("Démarrage du serveur...")
-
-	// 1. Récupération des variables d'environnement
+	// Initialisation des variables d'environnement
 	dbURL := os.Getenv("DB_URL")
 	if dbURL == "" {
 		dbURL = "postgres://devuser:devpassword@localhost:5433/calendar_db?sslmode=disable"
 	}
-
 	s3Endpoint := os.Getenv("S3_ENDPOINT")
 	if s3Endpoint == "" {
 		s3Endpoint = "http://localhost:3900"
 	}
 
-	// 2. Connexion à PostgreSQL
+	// PostgreSQL
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
-		log.Fatalf("Erreur d'initialisation de la base de données: %v", err)
+		log.Fatalf("Erreur DB: %v", err)
 	}
 	defer db.Close()
-
 	if err := db.Ping(); err != nil {
 		log.Fatalf("Impossible de contacter PostgreSQL: %v", err)
 	}
 	log.Println("✅ Connecté à PostgreSQL")
 
-	// 3. Connexion à Garage (S3)
-	customResolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
-		return aws.Endpoint{
-			PartitionID:   "aws",
-			URL:           s3Endpoint,
-			SigningRegion: "garage",
-		}, nil
-	})
+	// Création de la table users
+	createTableQuery := `
+	CREATE TABLE IF NOT EXISTS users (
+		id SERIAL PRIMARY KEY,
+		email VARCHAR(255) UNIQUE NOT NULL,
+		password_hash VARCHAR(255) NOT NULL,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	);`
+	if _, err := db.Exec(createTableQuery); err != nil {
+		log.Fatalf("❌ Erreur lors de la création de la table users: %v", err)
+	}
+	log.Println("✅ Table users prête")
 
+	// Garage (S3)
+	customResolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
+		return aws.Endpoint{PartitionID: "aws", URL: s3Endpoint, SigningRegion: "garage"}, nil
+	})
 	cfg, err := config.LoadDefaultConfig(context.TODO(),
 		config.WithEndpointResolverWithOptions(customResolver),
 		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("CLE_ACCES_DEV", "CLE_SECRETE_DEV", "")),
 	)
 	if err != nil {
-		log.Fatalf("Erreur de configuration AWS: %v", err)
+		log.Fatalf("Erreur AWS: %v", err)
 	}
-
-	s3Client := s3.NewFromConfig(cfg, func(o *s3.Options) {
-		o.UsePathStyle = true
-	})
+	s3Client := s3.NewFromConfig(cfg, func(o *s3.Options) { o.UsePathStyle = true })
 	_ = s3Client
-
 	log.Println("✅ Client S3 (Garage) initialisé")
 
-	// 4. Configuration du Routeur HTTP
+	// Lancement du Hub WebSocket
+	hub := newHub()
+	go hub.run()
+
 	mux := http.NewServeMux()
 
-	// Route de santé
-	mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{
-			"status": "ok",
-			"time":   time.Now().Format(time.RFC3339),
-		})
-	})
-
-	// Route WebSocket (Chat) - DÉPLACÉE ICI, AVANT ListenAndServe
-	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		// 1. Upgrade de la connexion HTTP vers WebSocket
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			log.Println("❌ Erreur d'upgrade WebSocket:", err)
+	// Inscription
+	mux.HandleFunc("POST /api/register", func(w http.ResponseWriter, r *http.Request) {
+		var creds Credentials
+		if err := json.NewDecoder(r.Body).Decode(&creds); err != nil {
+			http.Error(w, "Requête invalide", http.StatusBadRequest)
 			return
 		}
-		defer conn.Close()
-
-		log.Println("🔌 Nouveau client WebSocket connecté !")
-
-		// 2. Boucle d'écoute
-		for {
-			messageType, p, err := conn.ReadMessage()
-			if err != nil {
-				log.Println("🔌 Client déconnecté")
-				break
-			}
-			log.Printf("💬 Message reçu : %s", p)
-
-			// 3. Mode "Echo"
-			if err := conn.WriteMessage(messageType, p); err != nil {
-				log.Println("❌ Erreur d'écriture:", err)
-				break
-			}
+		hashedPassword, _ := bcrypt.GenerateFromPassword([]byte(creds.Password), 14)
+		_, err = db.Exec("INSERT INTO users (email, password_hash) VALUES ($1, $2)", creds.Email, string(hashedPassword))
+		if err != nil {
+			http.Error(w, "Cet email est déjà utilisé", http.StatusConflict)
+			return
 		}
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(map[string]string{"message": "Utilisateur créé"})
 	})
 
-	// 5. Lancement du serveur (TOUJOURS EN DERNIER)
-	port := ":8080"
-	log.Printf("🚀 Serveur à l'écoute sur le port %s", port)
-	if err := http.ListenAndServe(port, mux); err != nil {
-		log.Fatalf("Erreur du serveur HTTP: %v", err)
-	}
+	// Connexion
+	mux.HandleFunc("POST /api/login", func(w http.ResponseWriter, r *http.Request) {
+		var creds Credentials
+		if err := json.NewDecoder(r.Body).Decode(&creds); err != nil {
+			http.Error(w, "Requête invalide", http.StatusBadRequest)
+			return
+		}
+		var id int
+		var storedHash string
+		err := db.QueryRow("SELECT id, password_hash FROM users WHERE email = $1", creds.Email).Scan(&id, &storedHash)
+		if err != nil || bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(creds.Password)) != nil {
+			http.Error(w, "Identifiants incorrects", http.StatusUnauthorized)
+			return
+		}
+		expirationTime := time.Now().Add(24 * time.Hour)
+		claims := &Claims{
+			UserID:           id,
+			Email:            creds.Email,
+			RegisteredClaims: jwt.RegisteredClaims{ExpiresAt: jwt.NewNumericDate(expirationTime)},
+		}
+		token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+		tokenString, _ := token.SignedString(jwtKey)
+		json.NewEncoder(w).Encode(map[string]string{"token": tokenString})
+	})
+
+	// WebSocket
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		client := &Client{hub: hub, conn: conn, send: make(chan []byte, 256)}
+		client.hub.register <- client
+		go client.writePump()
+		go client.readPump()
+	})
+
+	log.Println("🚀 Serveur à l'écoute sur le port :8080")
+	// On enveloppe notre routeur (mux) avec le middleware CORS
+	handler := corsMiddleware(mux)
+	http.ListenAndServe(":8080", handler)
 }
