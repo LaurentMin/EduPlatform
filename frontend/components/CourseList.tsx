@@ -94,7 +94,7 @@ export default function CourseList() {
                           ? "bg-gray-500/10 text-gray-400 border-gray-500/20" // Gris
                           : course.status.toLowerCase().includes("confirmé")
                           ? "bg-green-500/10 text-green-400 border-green-500/20" // Vert
-                          : "bg-green-300 text-green-900 border-green-400" // Vert clair (Prévu / Accepté)
+                          : "bg-green-300 text-green-900 border-green-400" // Vert clair (Demandé)
                       }`}>
                         {course.status.toUpperCase()}
                       </span>

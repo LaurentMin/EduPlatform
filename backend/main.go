@@ -200,7 +200,7 @@ func main() {
 		title VARCHAR(255) NOT NULL,
 		scheduled_at TIMESTAMP NOT NULL,
 		duration VARCHAR(50) NOT NULL,
-		status VARCHAR(50) DEFAULT 'prévu',
+		status VARCHAR(50) DEFAULT 'demandé',
 		price NUMERIC(10, 2) DEFAULT 25.00,
 		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 	);`

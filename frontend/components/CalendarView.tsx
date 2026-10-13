@@ -68,7 +68,7 @@ export default function CalendarView() {
     if (s.includes("réalisé") || s.includes("realise")) {
       return "bg-gray-500 text-gray-100 border-gray-600"; // Gris
     }
-    return "bg-green-300 text-green-900 border-green-400"; // Prévu / En attente (défaut)
+    return "bg-green-300 text-green-900 border-green-400"; // Demandé / En attente (défaut)
   };
 
   // --- SOUMISSION DE LA RÉSERVATION ---
