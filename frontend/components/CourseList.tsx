@@ -10,11 +10,11 @@ type Course = {
   price: number;
 };
 
-export default function CourseList() {
+export default function CourseList({ isAdmin }: { isAdmin: boolean }) {
   const [courses, setCourses] = useState<Course[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
-
+  const [acceptingCourseId, setAcceptingCourseId] = useState<number | null>(null);
   useEffect(() => {
     const fetchCourses = async () => {
       const token = localStorage.getItem("token");
@@ -43,6 +43,37 @@ export default function CourseList() {
     fetchCourses();
   }, []);
 
+  const acceptCourse = async (courseId: number) => {
+    const token = localStorage.getItem("token");
+    if (!token) return;
+
+    setAcceptingCourseId(courseId);
+    setError("");
+    try {
+      const res = await fetch(`http://localhost:8080/api/courses/${courseId}/accept`, {
+        method: "PUT",
+        headers: {
+          "Authorization": `Bearer ${token}`
+        }
+      });
+
+      if (!res.ok) {
+        setError("Impossible d'accepter cette demande.");
+        return;
+      }
+
+      setCourses((previousCourses) =>
+        previousCourses.map((course) =>
+          course.id === courseId ? { ...course, status: "confirmé" } : course
+        )
+      );
+    } catch (err) {
+      setError("Serveur injoignable.");
+    } finally {
+      setAcceptingCourseId(null);
+    }
+  };
+
   return (
     <div className="h-full flex flex-col max-w-5xl mx-auto w-full">
       <h1 className="text-3xl font-bold mb-6">Historique des Cours</h1>
@@ -63,12 +94,13 @@ export default function CourseList() {
                 <th className="p-4 font-medium">Durée</th>
                 <th className="p-4 font-medium">Prix</th>
                 <th className="p-4 font-medium">Statut</th>
+                {isAdmin && <th className="p-4 font-medium">Action</th>}
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-700">
               {courses.length === 0 ? (
                 <tr>
-                  <td colSpan={5} className="p-8 text-center text-gray-400 italic">
+                  <td colSpan={isAdmin ? 6 : 5} className="p-8 text-center text-gray-400 italic">
                     Vous n'avez encore réservé aucun cours.
                   </td>
                 </tr>
@@ -99,6 +131,22 @@ export default function CourseList() {
                         {course.status.toUpperCase()}
                       </span>
                     </td>
+                    {isAdmin && (
+                      <td className="p-4">
+                        {course.status.toLowerCase().includes("demand") ? (
+                          <button
+                            type="button"
+                            onClick={() => acceptCourse(course.id)}
+                            disabled={acceptingCourseId === course.id}
+                            className="bg-blue-600 hover:bg-blue-500 px-3 py-2 rounded-lg text-sm font-bold disabled:opacity-50"
+                          >
+                            {acceptingCourseId === course.id ? "Acceptation..." : "Accepter"}
+                          </button>
+                        ) : (
+                          <span className="text-gray-500 text-sm">Traitée</span>
+                        )}
+                      </td>
+                    )}
                   </tr>
                 ))
               )}

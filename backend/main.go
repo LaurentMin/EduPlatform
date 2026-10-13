@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -398,6 +399,50 @@ func main() {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(courses)
+	})
+
+	// Accepter une demande de cours (réservé au professeur)
+	mux.HandleFunc("PUT /api/courses/{id}/accept", func(w http.ResponseWriter, r *http.Request) {
+		tokenString := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		claims := &Claims{}
+		token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) {
+			return jwtKey, nil
+		})
+		if token == nil || err != nil || !token.Valid {
+			http.Error(w, "Non autorisé", http.StatusUnauthorized)
+			return
+		}
+		if claims.Email != adminEmail {
+			http.Error(w, "Accès réservé au professeur", http.StatusForbidden)
+			return
+		}
+
+		courseID, err := strconv.Atoi(r.PathValue("id"))
+		if err != nil || courseID < 1 {
+			http.Error(w, "Identifiant de cours invalide", http.StatusBadRequest)
+			return
+		}
+		result, err := db.Exec(
+			"UPDATE courses SET status = 'confirmé' WHERE id = $1 AND status = 'demandé'",
+			courseID,
+		)
+		if err != nil {
+			http.Error(w, "Erreur base de données", http.StatusInternalServerError)
+			return
+		}
+
+		rowsAffected, err := result.RowsAffected()
+		if err != nil {
+			http.Error(w, "Erreur base de données", http.StatusInternalServerError)
+			return
+		}
+		if rowsAffected == 0 {
+			http.Error(w, "Demande introuvable ou déjà traitée", http.StatusConflict)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"message": "Cours accepté"})
 	})
 
 	// WebSocket

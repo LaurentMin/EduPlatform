@@ -51,7 +51,7 @@ export default function Home() {
       <main className="flex-1 p-8 flex flex-col overflow-hidden">
         {/* 2. Ajout de la condition pour afficher la liste des cours */}
         {activeTab === "calendar" && <CalendarView />}
-        {activeTab === "courses" && <CourseList />}
+        {activeTab === "courses" && <CourseList isAdmin={userEmail === "prof@skeuly.com"} />}
         {activeTab === "chat" && <ChatInterface userEmail={userEmail} />}
       </main>
     </div>
