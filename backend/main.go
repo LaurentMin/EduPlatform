@@ -24,15 +24,6 @@ import (
 
 var jwtKey = []byte("super_secret_key_pour_le_dev")
 
-type Course struct {
-	ID          int     `json:"id"`
-	Title       string  `json:"title"`
-	ScheduledAt string  `json:"date"`
-	Duration    string  `json:"duration"`
-	Status      string  `json:"status"`
-	Price       float64 `json:"price"`
-}
-
 type Credentials struct {
 	Email    string `json:"email"`
 	Password string `json:"password"`
@@ -44,29 +35,46 @@ type Claims struct {
 	jwt.RegisteredClaims
 }
 
+type Course struct {
+	ID          int     `json:"id"`
+	Title       string  `json:"title"`
+	ScheduledAt string  `json:"date"`
+	Duration    string  `json:"duration"`
+	Status      string  `json:"status"`
+	Price       float64 `json:"price"`
+}
+
 type Message struct {
 	Sender    string `json:"sender"`
+	Recipient string `json:"recipient"` // NOUVEAU: Le destinataire
 	Content   string `json:"content"`
 	Type      string `json:"type"`
 	Timestamp string `json:"timestamp"`
 }
 
+// NOUVEAU: Un payload qui transporte le JSON brut et la structure
+type MessagePayload struct {
+	Raw []byte
+	Msg Message
+}
+
 type Client struct {
-	hub  *Hub
-	conn *websocket.Conn
-	send chan []byte
+	hub   *Hub
+	conn  *websocket.Conn
+	send  chan []byte
+	email string // NOUVEAU: On stocke l'email pour l'identifier
 }
 
 type Hub struct {
 	clients    map[*Client]bool
-	broadcast  chan []byte
+	broadcast  chan MessagePayload // NOUVEAU: On utilise le payload
 	register   chan *Client
 	unregister chan *Client
 }
 
 func newHub() *Hub {
 	return &Hub{
-		broadcast:  make(chan []byte),
+		broadcast:  make(chan MessagePayload),
 		register:   make(chan *Client),
 		unregister: make(chan *Client),
 		clients:    make(map[*Client]bool),
@@ -80,20 +88,23 @@ func (h *Hub) run() {
 		select {
 		case client := <-h.register:
 			h.clients[client] = true
-			log.Printf("🔌 Client connecté. Total: %d", len(h.clients))
+			log.Printf("🔌 Client connecté: %s. Total: %d", client.email, len(h.clients))
 		case client := <-h.unregister:
 			if _, ok := h.clients[client]; ok {
 				delete(h.clients, client)
 				close(client.send)
-				log.Printf("🔌 Client déconnecté. Total: %d", len(h.clients))
+				log.Printf("🔌 Client déconnecté: %s. Total: %d", client.email, len(h.clients))
 			}
-		case message := <-h.broadcast:
+		case payload := <-h.broadcast:
+			// ROUTAGE PRIVÉ: On ne l'envoie qu'à l'expéditeur (pour ses autres onglets) et au destinataire
 			for client := range h.clients {
-				select {
-				case client.send <- message:
-				default:
-					close(client.send)
-					delete(h.clients, client)
+				if client.email == payload.Msg.Recipient || client.email == payload.Msg.Sender {
+					select {
+					case client.send <- payload.Raw:
+					default:
+						close(client.send)
+						delete(h.clients, client)
+					}
 				}
 			}
 		}
@@ -114,7 +125,8 @@ func (c *Client) readPump() {
 		if err := json.Unmarshal(p, &msg); err == nil {
 			msg.Timestamp = time.Now().Format(time.RFC3339)
 			out, _ := json.Marshal(msg)
-			c.hub.broadcast <- out
+			// On envoie le payload complet au Hub
+			c.hub.broadcast <- MessagePayload{Raw: out, Msg: msg}
 		}
 	}
 }
@@ -139,26 +151,21 @@ var upgrader = websocket.Upgrader{
 
 // --- 3. SERVEUR HTTP ET ROUTES ---
 
-// Middleware pour autoriser le frontend (CORS)
+// Middleware CORS
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Autoriser Next.js
 		w.Header().Set("Access-Control-Allow-Origin", "http://localhost:3000")
 		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
 		w.Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization")
-
-		// Les navigateurs envoient une requête OPTIONS avant le POST. On doit dire "OK".
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
-
 		next.ServeHTTP(w, r)
 	})
 }
 
 func main() {
-	// Initialisation des variables d'environnement
 	dbURL := os.Getenv("DB_URL")
 	if dbURL == "" {
 		dbURL = "postgres://devuser:devpassword@localhost:5433/calendar_db?sslmode=disable"
@@ -168,7 +175,6 @@ func main() {
 		s3Endpoint = "http://localhost:3900"
 	}
 
-	// PostgreSQL
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
 		log.Fatalf("Erreur DB: %v", err)
@@ -209,7 +215,7 @@ func main() {
 	}
 	log.Println("✅ Table courses prête")
 
-	// Garage (S3)
+	// S3 Garage
 	customResolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
 		return aws.Endpoint{PartitionID: "aws", URL: s3Endpoint, SigningRegion: "garage"}, nil
 	})
@@ -224,7 +230,7 @@ func main() {
 	_ = s3Client
 	log.Println("✅ Client S3 (Garage) initialisé")
 
-	// Lancement du Hub WebSocket
+	// Hub
 	hub := newHub()
 	go hub.run()
 
@@ -316,12 +322,38 @@ func main() {
 
 	// Récupérer la liste des cours (Protéger par JWT)
 	mux.HandleFunc("GET /api/courses", func(w http.ResponseWriter, r *http.Request) {
-		authHeader := r.Header.Get("Authorization")
-		if authHeader == "" {
+		tokenString := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		claims := &Claims{}
+		token, _ := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) { return jwtKey, nil })
+		if token == nil || !token.Valid {
 			http.Error(w, "Non autorisé", http.StatusUnauthorized)
 			return
 		}
-		tokenString := strings.TrimPrefix(authHeader, "Bearer ")
+		rows, _ := db.Query("SELECT id, title, scheduled_at, duration, status, price FROM courses WHERE client_id = $1 ORDER BY scheduled_at DESC", claims.UserID)
+		defer rows.Close()
+		var courses []Course
+		for rows.Next() {
+			var c Course
+			var scheduledAt time.Time
+			rows.Scan(&c.ID, &c.Title, &scheduledAt, &c.Duration, &c.Status, &c.Price)
+			c.ScheduledAt = scheduledAt.Format(time.RFC3339)
+			courses = append(courses, c)
+		}
+		if courses == nil {
+			courses = []Course{}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(courses)
+	})
+
+	// NOUVEAU: Websocket Sécurisé
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		// Récupération du token dans l'URL
+		tokenString := r.URL.Query().Get("token")
+		if tokenString == "" {
+			http.Error(w, "Token manquant", http.StatusUnauthorized)
+			return
+		}
 
 		claims := &Claims{}
 		token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) {
@@ -366,14 +398,14 @@ func main() {
 		if err != nil {
 			return
 		}
-		client := &Client{hub: hub, conn: conn, send: make(chan []byte, 256)}
+
+		// On lie l'email du JWT au Client
+		client := &Client{hub: hub, conn: conn, send: make(chan []byte, 256), email: claims.Email}
 		client.hub.register <- client
 		go client.writePump()
 		go client.readPump()
 	})
 
 	log.Println("🚀 Serveur à l'écoute sur le port :8080")
-	// On enveloppe notre routeur (mux) avec le middleware CORS
-	handler := corsMiddleware(mux)
-	http.ListenAndServe(":8080", handler)
+	http.ListenAndServe(":8080", corsMiddleware(mux))
 }
