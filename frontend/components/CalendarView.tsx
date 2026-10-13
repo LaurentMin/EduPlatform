@@ -1,9 +1,18 @@
 "use client";
-import { useState } from "react";
+import { useState, useEffect } from "react";
+
+type Course = {
+  id: number;
+  title: string;
+  date: string;
+  duration: string;
+  status: string;
+};
 
 export default function CalendarView() {
-  // --- ÉTATS DU CALENDRIER ---
+  // --- ÉTATS DU CALENDRIER ET DONNÉES ---
   const [currentDate, setCurrentDate] = useState(new Date());
+  const [courses, setCourses] = useState<Course[]>([]);
   
   // --- ÉTATS DE LA MODALE ---
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -11,40 +20,64 @@ export default function CalendarView() {
   const [formData, setFormData] = useState({ title: "", time: "14:00", duration: "1h" });
   const [successMsg, setSuccessMsg] = useState("");
 
-  // --- LOGIQUE DU CALENDRIER ---
   const year = currentDate.getFullYear();
   const month = currentDate.getMonth();
-  
-  // Nombre de jours dans le mois actuel
   const daysInMonth = new Date(year, month + 1, 0).getDate();
-  // Jour de la semaine du 1er du mois (0 = Dimanche, 1 = Lundi...)
   const firstDayOfMonth = new Date(year, month, 1).getDay();
-  // Décalage pour commencer la semaine le Lundi (au lieu du Dimanche)
   const emptyDaysOffset = firstDayOfMonth === 0 ? 6 : firstDayOfMonth - 1;
-
   const monthNames = ["Janvier", "Février", "Mars", "Avril", "Mai", "Juin", "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre"];
 
-  // Changer de mois
+  // --- RÉCUPÉRATION DES COURS DEPUIS L'API ---
+  const fetchCourses = async () => {
+    const token = localStorage.getItem("token");
+    if (!token) return;
+    try {
+      const res = await fetch("http://localhost:8080/api/courses", {
+        headers: { "Authorization": `Bearer ${token}` }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setCourses(data);
+      }
+    } catch (err) {
+      console.error("Erreur lors de la récupération des cours", err);
+    }
+  };
+
+  // Charger les cours au montage du composant
+  useEffect(() => {
+    fetchCourses();
+  }, []);
+
+  // --- HELPERS ---
   const prevMonth = () => setCurrentDate(new Date(year, month - 1, 1));
   const nextMonth = () => setCurrentDate(new Date(year, month + 1, 1));
 
-  // Ouvrir la modale pour un jour précis
   const handleDayClick = (day: number) => {
     setSelectedDay(day);
     setSuccessMsg("");
     setIsModalOpen(true);
   };
 
-  // Soumettre la demande (Simulation avant l'intégration backend)
+  // Fonction pour déterminer la couleur selon le statut
+  const getStatusStyle = (status: string) => {
+    const s = status.toLowerCase();
+    if (s.includes("confirmé") || s.includes("confirme")) {
+      return "bg-green-700 text-white border-green-800"; // Vert foncé
+    }
+    if (s.includes("réalisé") || s.includes("realise")) {
+      return "bg-gray-500 text-gray-100 border-gray-600"; // Gris
+    }
+    return "bg-green-300 text-green-900 border-green-400"; // Prévu / En attente (défaut)
+  };
+
+  // --- SOUMISSION DE LA RÉSERVATION ---
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     const token = localStorage.getItem("token");
-
     if (!selectedDay || !token) return;
 
-    // Extraire l'heure et les minutes ("14:00" -> 14, 0)
     const [hours, minutes] = formData.time.split(':').map(Number);
-    // Créer un objet Date local précis, puis le convertir en format ISO pour la DB
     const scheduledDate = new Date(year, month, selectedDay, hours, minutes);
 
     try {
@@ -52,7 +85,7 @@ export default function CalendarView() {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}` // On envoie le token ici
+          "Authorization": `Bearer ${token}`
         },
         body: JSON.stringify({
           title: formData.title,
@@ -63,11 +96,12 @@ export default function CalendarView() {
 
       if (res.ok) {
         setSuccessMsg("Demande envoyée au professeur ! ✅");
+        fetchCourses(); // Rafraîchir le calendrier pour afficher le nouveau cours
         setTimeout(() => {
           setIsModalOpen(false);
           setSuccessMsg("");
           setFormData({ title: "", time: "14:00", duration: "1h" });
-        }, 2000);
+        }, 1500);
       } else {
         setSuccessMsg("❌ Erreur lors de la réservation.");
       }
@@ -89,34 +123,52 @@ export default function CalendarView() {
         </div>
       </div>
 
-      {/* GRILLE DU CALENDRIER */}
       <div className="flex-1 bg-gray-800 border border-gray-700 rounded-xl p-6 shadow-lg flex flex-col">
-        {/* Jours de la semaine */}
         <div className="grid grid-cols-7 gap-2 mb-4 text-center font-bold text-gray-400">
           <div>Lun</div><div>Mar</div><div>Mer</div><div>Jeu</div><div>Ven</div><div>Sam</div><div>Dim</div>
         </div>
 
-        {/* Cases des jours */}
         <div className="grid grid-cols-7 gap-2 flex-1 auto-rows-fr">
-          {/* Cases vides pour le décalage du 1er jour */}
           {Array.from({ length: emptyDaysOffset }).map((_, i) => (
             <div key={`empty-${i}`} className="bg-gray-800/50 rounded-lg border border-gray-700/50 opacity-50"></div>
           ))}
           
-          {/* Cases des jours du mois */}
           {Array.from({ length: daysInMonth }).map((_, i) => {
             const day = i + 1;
             const isToday = day === new Date().getDate() && month === new Date().getMonth() && year === new Date().getFullYear();
             
+            // Filtrer les cours qui tombent ce jour-là
+            const dayCourses = courses.filter(c => {
+              const cDate = new Date(c.date);
+              return cDate.getDate() === day && cDate.getMonth() === month && cDate.getFullYear() === year;
+            });
+
             return (
               <button
                 key={day}
                 onClick={() => handleDayClick(day)}
-                className={`relative p-2 rounded-lg border flex flex-col items-start justify-start transition-all hover:border-blue-500 hover:bg-gray-700 group
-                  ${isToday ? 'border-blue-500 bg-blue-500/10 text-blue-400' : 'border-gray-700 bg-gray-750'}`}
+                className={`relative p-2 rounded-lg border flex flex-col items-start justify-start transition-all hover:border-blue-500 hover:bg-gray-700 group min-h-[100px] overflow-hidden
+                  ${isToday ? 'border-blue-500 bg-blue-500/10' : 'border-gray-700 bg-gray-750'}`}
               >
-                <span className={`font-bold ${isToday ? '' : 'text-gray-300 group-hover:text-white'}`}>{day}</span>
-                <span className="text-[10px] text-gray-500 mt-auto opacity-0 group-hover:opacity-100 transition-opacity">
+                <span className={`font-bold mb-1 ${isToday ? 'text-blue-400' : 'text-gray-300 group-hover:text-white'}`}>{day}</span>
+                
+                {/* AFFICHAGE DES COURS DU JOUR */}
+                <div className="flex flex-col w-full gap-1 overflow-y-auto no-scrollbar">
+                  {dayCourses.map(course => {
+                    const courseTime = new Date(course.date).toLocaleTimeString("fr-FR", { hour: '2-digit', minute: '2-digit' }).replace(':', 'h');
+                    return (
+                      <div 
+                        key={course.id} 
+                        className={`text-[10px] w-full text-left px-1.5 py-1 rounded border truncate shadow-sm ${getStatusStyle(course.status)}`}
+                        title={`${courseTime} - ${course.title} (${course.status})`} // Tooltip au survol
+                      >
+                        <span className="font-bold">{courseTime}</span> - {course.title}
+                      </div>
+                    );
+                  })}
+                </div>
+
+                <span className="text-[10px] text-gray-500 mt-auto pt-1 opacity-0 group-hover:opacity-100 transition-opacity w-full text-center">
                   + Réserver
                 </span>
               </button>

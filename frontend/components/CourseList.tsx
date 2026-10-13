@@ -90,9 +90,11 @@ export default function CourseList() {
                     <td className="p-4 text-white font-mono">{course.price} €</td>
                     <td className="p-4">
                       <span className={`px-3 py-1 rounded-full text-xs font-bold border ${
-                        course.status === "prévu" 
-                          ? "bg-blue-500/10 text-blue-400 border-blue-500/20" 
-                          : "bg-green-500/10 text-green-400 border-green-500/20"
+                        course.status.toLowerCase().includes("réalisé")
+                          ? "bg-gray-500/10 text-gray-400 border-gray-500/20" // Gris
+                          : course.status.toLowerCase().includes("confirmé")
+                          ? "bg-green-500/10 text-green-400 border-green-500/20" // Vert
+                          : "bg-green-300 text-green-900 border-green-400" // Vert clair (Prévu / Accepté)
                       }`}>
                         {course.status.toUpperCase()}
                       </span>
