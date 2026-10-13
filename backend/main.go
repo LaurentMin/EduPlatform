@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -22,6 +23,15 @@ import (
 // --- 1. CONFIGURATION ET MODÈLES ---
 
 var jwtKey = []byte("super_secret_key_pour_le_dev")
+
+type Course struct {
+	ID          int     `json:"id"`
+	Title       string  `json:"title"`
+	ScheduledAt string  `json:"date"`
+	Duration    string  `json:"duration"`
+	Status      string  `json:"status"`
+	Price       float64 `json:"price"`
+}
 
 type Credentials struct {
 	Email    string `json:"email"`
@@ -182,6 +192,23 @@ func main() {
 	}
 	log.Println("✅ Table users prête")
 
+	// Création de la table courses
+	createCoursesTableQuery := `
+	CREATE TABLE IF NOT EXISTS courses (
+		id SERIAL PRIMARY KEY,
+		client_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+		title VARCHAR(255) NOT NULL,
+		scheduled_at TIMESTAMP NOT NULL,
+		duration VARCHAR(50) NOT NULL,
+		status VARCHAR(50) DEFAULT 'prévu',
+		price NUMERIC(10, 2) DEFAULT 25.00,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	);`
+	if _, err := db.Exec(createCoursesTableQuery); err != nil {
+		log.Fatalf("❌ Erreur lors de la création de la table courses: %v", err)
+	}
+	log.Println("✅ Table courses prête")
+
 	// Garage (S3)
 	customResolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
 		return aws.Endpoint{PartitionID: "aws", URL: s3Endpoint, SigningRegion: "garage"}, nil
@@ -243,6 +270,94 @@ func main() {
 		token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 		tokenString, _ := token.SignedString(jwtKey)
 		json.NewEncoder(w).Encode(map[string]string{"token": tokenString})
+	})
+
+	// Créer une réservation (Protéger par JWT)
+	mux.HandleFunc("POST /api/courses", func(w http.ResponseWriter, r *http.Request) {
+		// 1. Extraire et vérifier le token
+		authHeader := r.Header.Get("Authorization")
+		if authHeader == "" {
+			http.Error(w, "Non autorisé", http.StatusUnauthorized)
+			return
+		}
+		tokenString := strings.TrimPrefix(authHeader, "Bearer ")
+
+		claims := &Claims{}
+		token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) {
+			return jwtKey, nil
+		})
+		if err != nil || !token.Valid {
+			http.Error(w, "Token invalide", http.StatusUnauthorized)
+			return
+		}
+
+		// 2. Décoder la demande
+		var req struct {
+			Title    string `json:"title"`
+			Date     string `json:"date"`
+			Duration string `json:"duration"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Requête invalide", http.StatusBadRequest)
+			return
+		}
+
+		// 3. Insérer en base de données avec l'ID du client (récupéré depuis le token)
+		query := `INSERT INTO courses (client_id, title, scheduled_at, duration) VALUES ($1, $2, $3, $4)`
+		_, err = db.Exec(query, claims.UserID, req.Title, req.Date, req.Duration)
+		if err != nil {
+			http.Error(w, "Erreur base de données", http.StatusInternalServerError)
+			return
+		}
+
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(map[string]string{"message": "Cours réservé avec succès"})
+	})
+
+	// Récupérer la liste des cours (Protéger par JWT)
+	mux.HandleFunc("GET /api/courses", func(w http.ResponseWriter, r *http.Request) {
+		authHeader := r.Header.Get("Authorization")
+		if authHeader == "" {
+			http.Error(w, "Non autorisé", http.StatusUnauthorized)
+			return
+		}
+		tokenString := strings.TrimPrefix(authHeader, "Bearer ")
+
+		claims := &Claims{}
+		token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) {
+			return jwtKey, nil
+		})
+		if err != nil || !token.Valid {
+			http.Error(w, "Token invalide", http.StatusUnauthorized)
+			return
+		}
+
+		// Requête SQL pour récupérer les cours du client connecté, triés par date
+		rows, err := db.Query("SELECT id, title, scheduled_at, duration, status, price FROM courses WHERE client_id = $1 ORDER BY scheduled_at DESC", claims.UserID)
+		if err != nil {
+			http.Error(w, "Erreur base de données", http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+
+		var courses []Course
+		for rows.Next() {
+			var c Course
+			var scheduledAt time.Time
+			if err := rows.Scan(&c.ID, &c.Title, &scheduledAt, &c.Duration, &c.Status, &c.Price); err != nil {
+				continue
+			}
+			c.ScheduledAt = scheduledAt.Format(time.RFC3339) // Format lisible par le front
+			courses = append(courses, c)
+		}
+
+		// Éviter de renvoyer "null" si le tableau est vide
+		if courses == nil {
+			courses = []Course{}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(courses)
 	})
 
 	// WebSocket

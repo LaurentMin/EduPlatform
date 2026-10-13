@@ -36,17 +36,44 @@ export default function CalendarView() {
   };
 
   // Soumettre la demande (Simulation avant l'intégration backend)
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    // Ici, on fera le fetch vers l'API Go plus tard
-    console.log("Demande de cours :", { day: selectedDay, month: month + 1, year, ...formData });
-    
-    setSuccessMsg("Demande envoyée au professeur ! ✅");
-    setTimeout(() => {
-      setIsModalOpen(false);
-      setSuccessMsg("");
-      setFormData({ title: "", time: "14:00", duration: "1h" }); // Reset
-    }, 2000);
+    const token = localStorage.getItem("token");
+
+    if (!selectedDay || !token) return;
+
+    // Extraire l'heure et les minutes ("14:00" -> 14, 0)
+    const [hours, minutes] = formData.time.split(':').map(Number);
+    // Créer un objet Date local précis, puis le convertir en format ISO pour la DB
+    const scheduledDate = new Date(year, month, selectedDay, hours, minutes);
+
+    try {
+      const res = await fetch("http://localhost:8080/api/courses", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}` // On envoie le token ici
+        },
+        body: JSON.stringify({
+          title: formData.title,
+          date: scheduledDate.toISOString(),
+          duration: formData.duration
+        })
+      });
+
+      if (res.ok) {
+        setSuccessMsg("Demande envoyée au professeur ! ✅");
+        setTimeout(() => {
+          setIsModalOpen(false);
+          setSuccessMsg("");
+          setFormData({ title: "", time: "14:00", duration: "1h" });
+        }, 2000);
+      } else {
+        setSuccessMsg("❌ Erreur lors de la réservation.");
+      }
+    } catch (err) {
+      setSuccessMsg("❌ Serveur injoignable.");
+    }
   };
 
   return (
