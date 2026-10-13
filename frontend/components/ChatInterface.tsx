@@ -4,7 +4,8 @@ import { useState, useEffect, useRef, useMemo } from "react";
 // On ajoute un champ 'recipient' pour savoir à qui s'adresse le message
 type Message = { sender: string; recipient: string; content: string; type: string; timestamp: string };
 
-const ADMIN_EMAIL = process.env.ADMIN_EMAIL;
+// const ADMIN_EMAIL = process.env.ADMIN_EMAIL;
+const ADMIN_EMAIL = "prof@skeuly.com";
 
 export default function ChatInterface({ userEmail }: { userEmail: string }) {
   const [messages, setMessages] = useState<Message[]>([]);

@@ -23,6 +23,7 @@ import (
 // --- 1. CONFIGURATION ET MODÈLES ---
 
 var jwtKey = []byte("super_secret_key_pour_le_dev")
+const adminEmail = "prof@skeuly.com"
 
 type Credentials struct {
 	Email    string `json:"email"`
@@ -63,6 +64,7 @@ type Client struct {
 	conn  *websocket.Conn
 	send  chan []byte
 	email string // NOUVEAU: On stocke l'email pour l'identifier
+	db    *sql.DB
 }
 
 type Hub struct {
@@ -123,9 +125,29 @@ func (c *Client) readPump() {
 		}
 		var msg Message
 		if err := json.Unmarshal(p, &msg); err == nil {
-			msg.Timestamp = time.Now().Format(time.RFC3339)
-			out, _ := json.Marshal(msg)
-			// On envoie le payload complet au Hub
+			msg.Sender = c.email
+			msg.Content = strings.TrimSpace(msg.Content)
+			if msg.Content == "" || msg.Recipient == "" {
+				continue
+			}
+
+			createdAt := time.Now().UTC()
+			msg.Timestamp = createdAt.Format(time.RFC3339)
+			_, err := c.db.Exec(
+				`INSERT INTO messages (sender, recipient, content, type, created_at)
+				 VALUES ($1, $2, $3, $4, $5)`,
+				msg.Sender, msg.Recipient, msg.Content, msg.Type, createdAt,
+			)
+			if err != nil {
+				log.Printf("❌ Erreur lors de l'enregistrement du message: %v", err)
+				continue
+			}
+
+			out, err := json.Marshal(msg)
+			if err != nil {
+				log.Printf("❌ Erreur de sérialisation du message: %v", err)
+				continue
+			}
 			c.hub.broadcast <- MessagePayload{Raw: out, Msg: msg}
 		}
 	}
@@ -214,6 +236,20 @@ func main() {
 		log.Fatalf("❌ Erreur lors de la création de la table courses: %v", err)
 	}
 	log.Println("✅ Table courses prête")
+
+	createMessagesTableQuery := `
+	CREATE TABLE IF NOT EXISTS messages (
+		id BIGSERIAL PRIMARY KEY,
+		sender VARCHAR(255) NOT NULL,
+		recipient VARCHAR(255) NOT NULL,
+		content TEXT NOT NULL,
+		type VARCHAR(50) NOT NULL DEFAULT 'text',
+		created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);`
+	if _, err := db.Exec(createMessagesTableQuery); err != nil {
+		log.Fatalf("❌ Erreur lors de la création de la table messages: %v", err)
+	}
+	log.Println("✅ Table messages prête")
 
 	// S3 Garage
 	customResolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
@@ -329,80 +365,110 @@ func main() {
 			http.Error(w, "Non autorisé", http.StatusUnauthorized)
 			return
 		}
-		rows, _ := db.Query("SELECT id, title, scheduled_at, duration, status, price FROM courses WHERE client_id = $1 ORDER BY scheduled_at DESC", claims.UserID)
-		defer rows.Close()
-		var courses []Course
-		for rows.Next() {
-			var c Course
-			var scheduledAt time.Time
-			rows.Scan(&c.ID, &c.Title, &scheduledAt, &c.Duration, &c.Status, &c.Price)
-			c.ScheduledAt = scheduledAt.Format(time.RFC3339)
-			courses = append(courses, c)
-		}
-		if courses == nil {
-			courses = []Course{}
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(courses)
-	})
-
-	// NOUVEAU: Websocket Sécurisé
-	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		// Récupération du token dans l'URL
-		tokenString := r.URL.Query().Get("token")
-		if tokenString == "" {
-			http.Error(w, "Token manquant", http.StatusUnauthorized)
-			return
+		query := "SELECT id, title, scheduled_at, duration, status, price FROM courses WHERE client_id = $1 ORDER BY scheduled_at DESC"
+		queryArgs := []interface{}{claims.UserID}
+		if claims.Email == adminEmail {
+			query = "SELECT id, title, scheduled_at, duration, status, price FROM courses ORDER BY scheduled_at DESC"
+			queryArgs = nil
 		}
 
-		claims := &Claims{}
-		token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) {
-			return jwtKey, nil
-		})
-		if err != nil || !token.Valid {
-			http.Error(w, "Token invalide", http.StatusUnauthorized)
-			return
-		}
-
-		// Requête SQL pour récupérer les cours du client connecté, triés par date
-		rows, err := db.Query("SELECT id, title, scheduled_at, duration, status, price FROM courses WHERE client_id = $1 ORDER BY scheduled_at DESC", claims.UserID)
+		rows, err := db.Query(query, queryArgs...)
 		if err != nil {
 			http.Error(w, "Erreur base de données", http.StatusInternalServerError)
 			return
 		}
 		defer rows.Close()
-
 		var courses []Course
 		for rows.Next() {
 			var c Course
 			var scheduledAt time.Time
 			if err := rows.Scan(&c.ID, &c.Title, &scheduledAt, &c.Duration, &c.Status, &c.Price); err != nil {
-				continue
+				http.Error(w, "Erreur base de données", http.StatusInternalServerError)
+				return
 			}
-			c.ScheduledAt = scheduledAt.Format(time.RFC3339) // Format lisible par le front
+			c.ScheduledAt = scheduledAt.Format(time.RFC3339)
 			courses = append(courses, c)
 		}
-
-		// Éviter de renvoyer "null" si le tableau est vide
+		if err := rows.Err(); err != nil {
+			http.Error(w, "Erreur base de données", http.StatusInternalServerError)
+			return
+		}
 		if courses == nil {
 			courses = []Course{}
 		}
-
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(courses)
 	})
 
 	// WebSocket
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		tokenString := r.URL.Query().Get("token")
+		claims := &Claims{}
+		token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) {
+			return jwtKey, nil
+		})
+		if tokenString == "" || err != nil || !token.Valid {
+			http.Error(w, "Token invalide", http.StatusUnauthorized)
+			return
+		}
+
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			return
 		}
 
-		// On lie l'email du JWT au Client
-		client := &Client{hub: hub, conn: conn, send: make(chan []byte, 256), email: claims.Email}
-		client.hub.register <- client
+		client := &Client{hub: hub, conn: conn, send: make(chan []byte, 256), email: claims.Email, db: db}
+		var history [][]byte
+
+		historyQuery := `
+			SELECT sender, recipient, content, type, created_at
+			FROM messages
+			WHERE (sender = $1 AND recipient = $2)
+			   OR (sender = $2 AND recipient = $1)
+			ORDER BY created_at ASC, id ASC`
+		historyArgs := []interface{}{claims.Email, adminEmail}
+		if claims.Email == adminEmail {
+			historyQuery = `
+				SELECT sender, recipient, content, type, created_at
+				FROM messages
+				ORDER BY created_at ASC, id ASC`
+			historyArgs = nil
+		}
+
+		rows, err := db.Query(historyQuery, historyArgs...)
+		if err != nil {
+			conn.Close()
+			log.Printf("❌ Erreur lors du chargement de l'historique: %v", err)
+			return
+		}
+		for rows.Next() {
+			var msg Message
+			var createdAt time.Time
+			if err := rows.Scan(&msg.Sender, &msg.Recipient, &msg.Content, &msg.Type, &createdAt); err != nil {
+				rows.Close()
+				conn.Close()
+				log.Printf("❌ Erreur lors de la lecture de l'historique: %v", err)
+				return
+			}
+			msg.Timestamp = createdAt.Format(time.RFC3339)
+			raw, err := json.Marshal(msg)
+			if err != nil {
+				continue
+			}
+			history = append(history, raw)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			conn.Close()
+			log.Printf("❌ Erreur lors du chargement de l'historique: %v", err)
+			return
+		}
+
 		go client.writePump()
+		for _, raw := range history {
+			client.send <- raw
+		}
+		client.hub.register <- client
 		go client.readPump()
 	})
 
