@@ -29,6 +29,21 @@ import (
 var jwtKey = []byte("super_secret_key_pour_le_dev")
 const adminEmail = "prof@skeuly.com"
 
+func authorizeAdmin(r *http.Request) error {
+	tokenString := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	claims := &Claims{}
+	token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) {
+		return jwtKey, nil
+	})
+	if err != nil || token == nil || !token.Valid {
+		return fmt.Errorf("Non autorisé")
+	}
+	if strings.TrimSpace(strings.ToLower(claims.Email)) != adminEmail {
+		return fmt.Errorf("Accès réservé au professeur")
+	}
+	return nil
+}
+
 type Credentials struct {
 	Email    string `json:"email"`
 	Password string `json:"password"`
@@ -53,6 +68,10 @@ type Availability struct {
 	ID        int       `json:"id"`
 	Start     time.Time `json:"start"`
 	End       time.Time `json:"end"`
+	Recurring bool      `json:"recurring"`
+	RuleID    int       `json:"rule_id,omitempty"`
+	RuleStart string    `json:"rule_start,omitempty"`
+	RuleEnd   string    `json:"rule_end,omitempty"`
 }
 
 type AvailabilityRule struct {
@@ -127,25 +146,6 @@ func hasAvailability(tx *sql.Tx, start time.Time, duration int) (bool, error) {
 		end   time.Time
 	}
 	intervals := []interval{}
-	rows, err := tx.Query(`
-		SELECT avail_start, avail_end
-		FROM availabilities
-		WHERE avail_start < $2 AND avail_end > $1
-		ORDER BY avail_start`, start, end)
-	if err != nil {
-		return false, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-	var availableStart, availableEnd time.Time
-	if err := rows.Scan(&availableStart, &availableEnd); err != nil {
-		return false, err
-	}
-	intervals = append(intervals, interval{availableStart, availableEnd})
-	}
-	if err := rows.Err(); err != nil {
-	return false, err
-	}
 	ruleRows, err := tx.Query(`
 		SELECT weekday, start_time::text, end_time::text
 		FROM availability_rules`)
@@ -154,44 +154,44 @@ func hasAvailability(tx *sql.Tx, start time.Time, duration int) (bool, error) {
 	}
 	defer ruleRows.Close()
 	for ruleRows.Next() {
-	var weekday int
-	var startClock, endClock string
-	if err := ruleRows.Scan(&weekday, &startClock, &endClock); err != nil {
-		return false, err
-	}
-	clockStart, err := time.Parse("15:04:05", startClock)
-	if err != nil {
-		return false, err
-	}
-	clockEnd, err := time.Parse("15:04:05", endClock)
-	if err != nil {
-		return false, err
-	}
-	for day := start.AddDate(0, 0, -1); day.Before(end); day = day.AddDate(0, 0, 1) {
-		if int(day.Weekday()) == weekday {
-			dayStart := time.Date(day.Year(), day.Month(), day.Day(), clockStart.Hour(), clockStart.Minute(), 0, 0, start.Location())
-			dayEnd := time.Date(day.Year(), day.Month(), day.Day(), clockEnd.Hour(), clockEnd.Minute(), 0, 0, start.Location())
-			intervals = append(intervals, interval{dayStart, dayEnd})
+		var weekday int
+		var startClock, endClock string
+		if err := ruleRows.Scan(&weekday, &startClock, &endClock); err != nil {
+			return false, err
+		}
+		clockStart, err := time.Parse("15:04:05", startClock)
+		if err != nil {
+			return false, err
+		}
+		clockEnd, err := time.Parse("15:04:05", endClock)
+		if err != nil {
+			return false, err
+		}
+		for day := start.AddDate(0, 0, -1); day.Before(end); day = day.AddDate(0, 0, 1) {
+			if int(day.Weekday()) == weekday {
+				dayStart := time.Date(day.Year(), day.Month(), day.Day(), clockStart.Hour(), clockStart.Minute(), 0, 0, start.Location())
+				dayEnd := time.Date(day.Year(), day.Month(), day.Day(), clockEnd.Hour(), clockEnd.Minute(), 0, 0, start.Location())
+				intervals = append(intervals, interval{dayStart, dayEnd})
+			}
 		}
 	}
-	}
 	if err := ruleRows.Err(); err != nil {
-	return false, err
+		return false, err
 	}
 	sort.Slice(intervals, func(i, j int) bool {
-	return intervals[i].start.Before(intervals[j].start)
+		return intervals[i].start.Before(intervals[j].start)
 	})
 	coveredUntil := start
 	for _, available := range intervals {
-	if available.start.After(coveredUntil) {
-		continue
-	}
-	if available.end.After(coveredUntil) {
-		coveredUntil = available.end
-	}
-	if !coveredUntil.Before(end) {
-		return true, nil
-	}
+		if available.start.After(coveredUntil) {
+			continue
+		}
+		if available.end.After(coveredUntil) {
+			coveredUntil = available.end
+		}
+		if !coveredUntil.Before(end) {
+			return true, nil
+		}
 	}
 	return false, nil
 }
@@ -402,18 +402,10 @@ func main() {
 	}
 	log.Println("✅ Table messages prête")
 
-	createAvailabilitiesTableQuery := `
-	CREATE TABLE IF NOT EXISTS availabilities (
-		id SERIAL PRIMARY KEY,
-		avail_start TIMESTAMPTZ NOT NULL,
-		avail_end TIMESTAMPTZ NOT NULL,
-		CONSTRAINT availability_range_valid CHECK (avail_end > avail_start),
-		CONSTRAINT availability_start_unique UNIQUE (avail_start)
-	);`
-	if _, err := db.Exec(createAvailabilitiesTableQuery); err != nil {
-		log.Fatalf("❌ Erreur lors de la création de la table availabilities: %v", err)
+	if _, err := db.Exec(`DROP TABLE IF EXISTS availabilities`); err != nil {
+		log.Fatalf("❌ Erreur lors de la suppression de la table availabilities: %v", err)
 	}
-	log.Println("✅ Table availabilities prête")
+	log.Println("✅ Table availabilities supprimée")
 
 	if _, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS availability_rules (
@@ -597,25 +589,7 @@ func main() {
 			http.Error(w, "Période invalide", http.StatusBadRequest)
 			return
 		}
-		rows, err := db.Query(
-			`SELECT id, avail_start, avail_end FROM availabilities
-			 WHERE avail_start >= $1 AND avail_end <= $2 ORDER BY avail_start`,
-			start, end,
-		)
-		if err != nil {
-			http.Error(w, "Erreur base de données", http.StatusInternalServerError)
-			return
-		}
-		defer rows.Close()
 		availabilities := []Availability{}
-		for rows.Next() {
-			var availability Availability
-			if err := rows.Scan(&availability.ID, &availability.Start, &availability.End); err != nil {
-				http.Error(w, "Erreur base de données", http.StatusInternalServerError)
-				return
-			}
-			availabilities = append(availabilities, availability)
-		}
 		ruleRows, err := db.Query(`
 			SELECT id, weekday, start_time::text, end_time::text
 			FROM availability_rules`)
@@ -650,7 +624,8 @@ func main() {
 				dayEnd := time.Date(day.Year(), day.Month(), day.Day(), ruleEnd.Hour(), ruleEnd.Minute(), 0, 0, day.Location())
 				for slot := dayStart; slot.Before(dayEnd); slot = slot.Add(15 * time.Minute) {
 					availabilities = append(availabilities, Availability{
-						ID: -rule.ID,
+						ID: -rule.ID, Recurring: true, RuleID: rule.ID,
+						RuleStart: rule.StartTime, RuleEnd: rule.EndTime,
 						Start: slot,
 						End: slot.Add(15 * time.Minute),
 					})
@@ -663,15 +638,11 @@ func main() {
 			return
 		}
 		ruleRows.Close()
-		if err := rows.Err(); err != nil {
-			http.Error(w, "Erreur base de données", http.StatusInternalServerError)
-			return
-		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(availabilities)
 	})
 
-	// Définir une disponibilité de 15 minutes (réservé au professeur)
+	// Définir une règle de disponibilité hebdomadaire (réservé au professeur)
 	mux.HandleFunc("POST /api/availability", func(w http.ResponseWriter, r *http.Request) {
 		tokenString := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		claims := &Claims{}
@@ -690,7 +661,6 @@ func main() {
 			Date      string `json:"date"`
 			Start     string `json:"start"`
 			End       string `json:"end"`
-			Recurring bool   `json:"recurring"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "Requête invalide", http.StatusBadRequest)
@@ -716,47 +686,22 @@ func main() {
 			http.Error(w, "Les horaires doivent être espacés de 15 minutes et être dans le futur", http.StatusBadRequest)
 			return
 		}
-		if req.Recurring {
-			_, err = db.Exec(
-				`INSERT INTO availability_rules (weekday, start_time, end_time)
-				 VALUES ($1, $2, $3)`,
-				int(start.Weekday()), start.Format("15:04:05"), end.Format("15:04:05"),
-			)
-			if err != nil {
-				http.Error(w, "Erreur base de données", http.StatusInternalServerError)
-				return
-			}
-			w.WriteHeader(http.StatusCreated)
-			json.NewEncoder(w).Encode(map[string]string{"message": "Disponibilité récurrente ajoutée"})
+		_, err = db.Exec(
+			`INSERT INTO availability_rules (weekday, start_time, end_time)
+			 VALUES ($1, $2, $3)`,
+			int(start.Weekday()), start.Format("15:04:05"), end.Format("15:04:05"),
+		)
+		if err != nil {
+			http.Error(w, "Erreur base de données", http.StatusInternalServerError)
 			return
-		}
-		for slot := start; slot.Before(end); slot = slot.Add(15 * time.Minute) {
-			_, err = db.Exec(
-				"INSERT INTO availabilities (avail_start, avail_end) VALUES ($1, $2) ON CONFLICT (avail_start) DO NOTHING",
-				slot, slot.Add(15*time.Minute),
-			)
-			if err != nil {
-				http.Error(w, "Erreur base de données", http.StatusInternalServerError)
-				return
-			}
 		}
 		w.WriteHeader(http.StatusCreated)
-		json.NewEncoder(w).Encode(map[string]string{"message": "Disponibilité ajoutée"})
+		json.NewEncoder(w).Encode(map[string]string{"message": "Règle de disponibilité ajoutée"})
 	})
 
-	// Retirer une disponibilité (réservé au professeur)
-	mux.HandleFunc("DELETE /api/availability/{id}", func(w http.ResponseWriter, r *http.Request) {
-		tokenString := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		claims := &Claims{}
-		token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) {
-			return jwtKey, nil
-		})
-		if token == nil || err != nil || !token.Valid {
-			http.Error(w, "Non autorisé", http.StatusUnauthorized)
-			return
-		}
-		if claims.Email != adminEmail {
-			http.Error(w, "Accès réservé au professeur", http.StatusForbidden)
+	mux.HandleFunc("PUT /api/availability-rules/{id}", func(w http.ResponseWriter, r *http.Request) {
+		if err := authorizeAdmin(r); err != nil {
+			http.Error(w, err.Error(), http.StatusForbidden)
 			return
 		}
 		id, err := strconv.Atoi(r.PathValue("id"))
@@ -764,14 +709,48 @@ func main() {
 			http.Error(w, "Identifiant invalide", http.StatusBadRequest)
 			return
 		}
-		result, err := db.Exec("DELETE FROM availabilities WHERE id = $1", id)
+		var req struct{ Start, End string }
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Requête invalide", http.StatusBadRequest)
+			return
+		}
+		start, startErr := time.Parse("15:04", req.Start)
+		end, endErr := time.Parse("15:04", req.End)
+		if startErr != nil || endErr != nil || !end.After(start) || start.Minute()%15 != 0 || end.Minute()%15 != 0 {
+			http.Error(w, "Horaires invalides", http.StatusBadRequest)
+			return
+		}
+		result, err := db.Exec("UPDATE availability_rules SET start_time = $1, end_time = $2 WHERE id = $3", req.Start, req.End, id)
 		if err != nil {
 			http.Error(w, "Erreur base de données", http.StatusInternalServerError)
 			return
 		}
 		affected, _ := result.RowsAffected()
 		if affected == 0 {
-			http.Error(w, "Disponibilité introuvable", http.StatusNotFound)
+			http.Error(w, "Règle introuvable", http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	mux.HandleFunc("DELETE /api/availability-rules/{id}", func(w http.ResponseWriter, r *http.Request) {
+		if err := authorizeAdmin(r); err != nil {
+			http.Error(w, err.Error(), http.StatusForbidden)
+			return
+		}
+		id, err := strconv.Atoi(r.PathValue("id"))
+		if err != nil || id < 1 {
+			http.Error(w, "Identifiant invalide", http.StatusBadRequest)
+			return
+		}
+		result, err := db.Exec("DELETE FROM availability_rules WHERE id = $1", id)
+		if err != nil {
+			http.Error(w, "Erreur base de données", http.StatusInternalServerError)
+			return
+		}
+		affected, _ := result.RowsAffected()
+		if affected == 0 {
+			http.Error(w, "Règle introuvable", http.StatusNotFound)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)

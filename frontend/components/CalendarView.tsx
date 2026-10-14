@@ -13,6 +13,10 @@ type Availability = {
   id: number;
   start: string;
   end: string;
+  recurring: true;
+  rule_id: number;
+  rule_start: string;
+  rule_end: string;
 };
 
 export default function CalendarView({ isAdmin }: { isAdmin: boolean }) {
@@ -22,11 +26,12 @@ export default function CalendarView({ isAdmin }: { isAdmin: boolean }) {
   const [availabilities, setAvailabilities] = useState<Availability[]>([]);
   const [availabilityError, setAvailabilityError] = useState("");
   const [isAvailabilityModalOpen, setIsAvailabilityModalOpen] = useState(false);
+  const [selectedAvailability, setSelectedAvailability] = useState<Availability | null>(null);
+  const [availabilityEditForm, setAvailabilityEditForm] = useState({ start: "", end: "" });
   const [availabilityForm, setAvailabilityForm] = useState({
     date: new Date().toISOString().slice(0, 10),
     start: "08:00",
-    end: "19:45",
-    recurring: false
+    end: "19:45"
   });
   
   // --- ÉTATS DE LA MODALE ---
@@ -150,6 +155,67 @@ export default function CalendarView({ isAdmin }: { isAdmin: boolean }) {
     );
   };
 
+  const openAvailabilityEditor = (day: Date, hour: number, minute: number) => {
+    const slotStart = getSlotStart(day, hour, minute);
+    const availability = availabilities.find((item) =>
+      new Date(item.start) <= slotStart && new Date(item.end) >= new Date(slotStart.getTime() + 15 * 60 * 1000)
+    );
+    if (!availability) return;
+    setSelectedAvailability(availability);
+    setAvailabilityEditForm({
+      start: availability.rule_start.slice(0, 5),
+      end: availability.rule_end.slice(0, 5)
+    });
+  };
+
+  const refreshAvailabilities = async () => {
+    const token = localStorage.getItem("token");
+    if (!token) return;
+    const end = new Date(weekStart);
+    end.setDate(end.getDate() + 7);
+    const response = await fetch(
+      `http://localhost:8080/api/availability?start=${encodeURIComponent(weekStart.toISOString())}&end=${encodeURIComponent(end.toISOString())}`,
+      { headers: { "Authorization": `Bearer ${token}` } }
+    );
+    if (response.ok) setAvailabilities(await response.json());
+  };
+
+  const updateAvailability = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!selectedAvailability) return;
+    const token = localStorage.getItem("token");
+    if (!token) return;
+    const endpoint = `http://localhost:8080/api/availability-rules/${selectedAvailability.rule_id}`;
+    const response = await fetch(endpoint, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
+      body: JSON.stringify({ start: availabilityEditForm.start, end: availabilityEditForm.end })
+    });
+    if (!response.ok) {
+      setAvailabilityError(await response.text() || "Impossible de modifier cette disponibilité.");
+      return;
+    }
+    setSelectedAvailability(null);
+    await refreshAvailabilities();
+  };
+
+  const deleteAvailability = async () => {
+    if (!selectedAvailability) return;
+    const token = localStorage.getItem("token");
+    if (!token) return;
+    const endpoint = `http://localhost:8080/api/availability-rules/${selectedAvailability.rule_id}`;
+    const response = await fetch(endpoint, {
+      method: "DELETE",
+      headers: { "Authorization": `Bearer ${token}` }
+    });
+    if (!response.ok) {
+      setAvailabilityError(await response.text() || "Impossible de supprimer cette disponibilité.");
+      return;
+    }
+    setSelectedAvailability(null);
+    await refreshAvailabilities();
+  };
+
   const addAvailability = async (event: React.FormEvent) => {
     event.preventDefault();
     const token = localStorage.getItem("token");
@@ -162,7 +228,11 @@ export default function CalendarView({ isAdmin }: { isAdmin: boolean }) {
           "Content-Type": "application/json",
           "Authorization": `Bearer ${token}`
         },
-        body: JSON.stringify(availabilityForm)
+        body: JSON.stringify({
+          date: availabilityForm.date,
+          start: availabilityForm.start,
+          end: availabilityForm.end
+        })
       });
       if (!res.ok) {
         setAvailabilityError(await res.text() || "Impossible d'ajouter cette disponibilité.");
@@ -256,7 +326,7 @@ export default function CalendarView({ isAdmin }: { isAdmin: boolean }) {
         </div>
         {isAdmin && (
           <p className="text-sm text-gray-400 mb-3">
-            Utilisez le bouton « Ajouter » pour définir une disponibilité ponctuelle ou récurrente.
+            Utilisez le bouton « Ajouter » pour définir une règle de disponibilité hebdomadaire.
           </p>
         )}
         {availabilityError && (
@@ -304,14 +374,9 @@ export default function CalendarView({ isAdmin }: { isAdmin: boolean }) {
                     />
                   </label>
                 </div>
-                <label className="flex items-center gap-2 text-sm text-gray-300">
-                  <input
-                    type="checkbox"
-                    checked={availabilityForm.recurring}
-                    onChange={(event) => setAvailabilityForm({ ...availabilityForm, recurring: event.target.checked })}
-                  />
-                  Répéter toutes les semaines
-                </label>
+                <p className="text-sm text-gray-400">
+                  Cette disponibilité sera répétée chaque semaine.
+                </p>
                 <div className="flex gap-3 pt-2">
                   <button type="button" onClick={() => setIsAvailabilityModalOpen(false)} className="flex-1 py-2 rounded-lg bg-gray-700 hover:bg-gray-600 font-bold">
                     Annuler
@@ -320,6 +385,40 @@ export default function CalendarView({ isAdmin }: { isAdmin: boolean }) {
                     Ajouter
                   </button>
                 </div>
+              </div>
+            </form>
+          </div>
+        )}
+        {selectedAvailability && (
+          <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center backdrop-blur-sm">
+            <form onSubmit={updateAvailability} className="bg-gray-800 border border-gray-700 p-6 rounded-xl shadow-2xl w-full max-w-md">
+              <div className="flex justify-between items-center mb-5">
+                <h2 className="text-xl font-bold">
+                  Modifier la règle hebdomadaire
+                </h2>
+                <button type="button" onClick={() => setSelectedAvailability(null)} className="text-gray-400 hover:text-white">&times;</button>
+              </div>
+              <div className="flex gap-3">
+                <label className="flex-1 text-sm text-gray-300">
+                  Début
+                  <input type="time" step="900" required value={availabilityEditForm.start}
+                    onChange={(event) => setAvailabilityEditForm({ ...availabilityEditForm, start: event.target.value })}
+                    className="mt-1 w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-white" />
+                </label>
+                <label className="flex-1 text-sm text-gray-300">
+                  Fin
+                  <input type="time" step="900" required value={availabilityEditForm.end}
+                    onChange={(event) => setAvailabilityEditForm({ ...availabilityEditForm, end: event.target.value })}
+                    className="mt-1 w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-white" />
+                </label>
+              </div>
+              <div className="flex gap-3 pt-5">
+                <button type="button" onClick={deleteAvailability} className="flex-1 py-2 rounded-lg bg-red-700 hover:bg-red-600 font-bold">
+                  Supprimer
+                </button>
+                <button type="submit" className="flex-1 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 font-bold">
+                  Enregistrer
+                </button>
               </div>
             </form>
           </div>
@@ -359,8 +458,9 @@ export default function CalendarView({ isAdmin }: { isAdmin: boolean }) {
                   <button
                     key={`${day.toISOString()}-${hour}-${minute}`}
                     type="button"
-                    onClick={() => !isAdmin && available && handleSlotClick(day, hour, minute)}
-                    disabled={isAdmin || !available}
+                    onClick={() => isAdmin
+                      ? available && openAvailabilityEditor(day, hour, minute)
+                      : available && handleSlotClick(day, hour, minute)}
                     className={`relative border-r border-b border-gray-700 transition-colors text-left ${
                       available ? "bg-blue-500/10 hover:bg-blue-500/20" : "bg-gray-800/60"
                     }`}
