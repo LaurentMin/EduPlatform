@@ -30,6 +30,14 @@ var jwtKey = []byte("super_secret_key_pour_le_dev")
 
 const adminEmail = "prof@skeuly.com"
 
+var availabilityLocation = func() *time.Location {
+	location, err := time.LoadLocation("Europe/Paris")
+	if err != nil {
+		return time.Local
+	}
+	return location
+}()
+
 func authorizeAdmin(r *http.Request) error {
 	tokenString := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 	claims := &Claims{}
@@ -145,6 +153,7 @@ func hasScheduleConflict(tx *sql.Tx, courseID int, start time.Time, duration int
 }
 
 func hasAvailability(tx *sql.Tx, start time.Time, duration int) (bool, error) {
+	start = start.In(availabilityLocation)
 	end := start.Add(time.Duration(duration) * time.Minute)
 	type interval struct {
 		start time.Time
@@ -178,8 +187,8 @@ func hasAvailability(tx *sql.Tx, start time.Time, duration int) (bool, error) {
 			exceptionRows.Close()
 			return false, err
 		}
-		dayStart := time.Date(date.Year(), date.Month(), date.Day(), clockStart.Hour(), clockStart.Minute(), 0, 0, start.Location())
-		dayEnd := time.Date(date.Year(), date.Month(), date.Day(), clockEnd.Hour(), clockEnd.Minute(), 0, 0, start.Location())
+		dayStart := time.Date(date.Year(), date.Month(), date.Day(), clockStart.Hour(), clockStart.Minute(), 0, 0, availabilityLocation)
+		dayEnd := time.Date(date.Year(), date.Month(), date.Day(), clockEnd.Hour(), clockEnd.Minute(), 0, 0, availabilityLocation)
 		exceptions[date.Format("2006-01-02")] = struct {
 			start time.Time
 			end   time.Time
@@ -217,8 +226,8 @@ func hasAvailability(tx *sql.Tx, start time.Time, duration int) (bool, error) {
 				if _, overridden := exceptions[day.Format("2006-01-02")]; overridden {
 					continue
 				}
-				dayStart := time.Date(day.Year(), day.Month(), day.Day(), clockStart.Hour(), clockStart.Minute(), 0, 0, start.Location())
-				dayEnd := time.Date(day.Year(), day.Month(), day.Day(), clockEnd.Hour(), clockEnd.Minute(), 0, 0, start.Location())
+				dayStart := time.Date(day.Year(), day.Month(), day.Day(), clockStart.Hour(), clockStart.Minute(), 0, 0, availabilityLocation)
+				dayEnd := time.Date(day.Year(), day.Month(), day.Day(), clockEnd.Hour(), clockEnd.Minute(), 0, 0, availabilityLocation)
 				intervals = append(intervals, interval{dayStart, dayEnd})
 			}
 		}
@@ -647,6 +656,8 @@ func main() {
 			http.Error(w, "Période invalide", http.StatusBadRequest)
 			return
 		}
+		start = start.In(availabilityLocation)
+		end = end.In(availabilityLocation)
 		availabilities := []Availability{}
 		exceptions := make(map[string]struct {
 			id    int
@@ -657,7 +668,7 @@ func main() {
 			SELECT id, exception_date::text, start_time::text, end_time::text
 			FROM availability_exceptions
 			WHERE exception_date >= $1::date AND exception_date < $2::date`,
-			start, end,
+			start.Format("2006-01-02"), end.Format("2006-01-02"),
 		)
 		if err != nil {
 			http.Error(w, "Erreur base de données", http.StatusInternalServerError)
@@ -791,7 +802,7 @@ func main() {
 			http.Error(w, "Requête invalide", http.StatusBadRequest)
 			return
 		}
-		startDate, err := time.Parse("2006-01-02", req.Date)
+		startDate, err := time.ParseInLocation("2006-01-02", req.Date, availabilityLocation)
 		if err != nil {
 			http.Error(w, "Date invalide", http.StatusBadRequest)
 			return
@@ -802,8 +813,8 @@ func main() {
 			http.Error(w, "Horaire invalide", http.StatusBadRequest)
 			return
 		}
-		start := time.Date(startDate.Year(), startDate.Month(), startDate.Day(), startClock.Hour(), startClock.Minute(), 0, 0, time.Local)
-		end := time.Date(startDate.Year(), startDate.Month(), startDate.Day(), endClock.Hour(), endClock.Minute(), 0, 0, time.Local)
+		start := time.Date(startDate.Year(), startDate.Month(), startDate.Day(), startClock.Hour(), startClock.Minute(), 0, 0, availabilityLocation)
+		end := time.Date(startDate.Year(), startDate.Month(), startDate.Day(), endClock.Hour(), endClock.Minute(), 0, 0, availabilityLocation)
 		if !start.After(time.Now()) || !end.After(start) ||
 			start.Second() != 0 || start.Nanosecond() != 0 ||
 			end.Second() != 0 || end.Nanosecond() != 0 ||
