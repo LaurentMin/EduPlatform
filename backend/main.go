@@ -27,6 +27,7 @@ import (
 // --- 1. CONFIGURATION ET MODÈLES ---
 
 var jwtKey = []byte("super_secret_key_pour_le_dev")
+
 const adminEmail = "prof@skeuly.com"
 
 func authorizeAdmin(r *http.Request) error {
@@ -65,20 +66,24 @@ type Course struct {
 }
 
 type Availability struct {
-	ID        int       `json:"id"`
-	Start     time.Time `json:"start"`
-	End       time.Time `json:"end"`
-	Recurring bool      `json:"recurring"`
-	RuleID    int       `json:"rule_id,omitempty"`
-	RuleStart string    `json:"rule_start,omitempty"`
-	RuleEnd   string    `json:"rule_end,omitempty"`
+	ID            int       `json:"id"`
+	Start         time.Time `json:"start"`
+	End           time.Time `json:"end"`
+	Recurring     bool      `json:"recurring"`
+	Exceptional   bool      `json:"exceptional,omitempty"`
+	RuleID        int       `json:"rule_id,omitempty"`
+	RuleWeekday   int       `json:"rule_weekday,omitempty"`
+	RuleStart     string    `json:"rule_start,omitempty"`
+	RuleEnd       string    `json:"rule_end,omitempty"`
+	ExceptionID   int       `json:"exception_id,omitempty"`
+	ExceptionDate string    `json:"exception_date,omitempty"`
 }
 
 type AvailabilityRule struct {
-	ID        int       `json:"id"`
-	Weekday   int       `json:"weekday"`
-	StartTime string    `json:"start_time"`
-	EndTime   string    `json:"end_time"`
+	ID        int    `json:"id"`
+	Weekday   int    `json:"weekday"`
+	StartTime string `json:"start_time"`
+	EndTime   string `json:"end_time"`
 }
 
 var durationPattern = regexp.MustCompile(`(?i)^\s*(\d+)\s*h\s*(?:(\d+)\s*m)?\s*$`)
@@ -146,11 +151,51 @@ func hasAvailability(tx *sql.Tx, start time.Time, duration int) (bool, error) {
 		end   time.Time
 	}
 	intervals := []interval{}
+	exceptions := make(map[string]struct {
+		start time.Time
+		end   time.Time
+	})
+	exceptionRows, err := tx.Query(`
+		SELECT exception_date, start_time::text, end_time::text
+		FROM availability_exceptions`)
+	if err != nil {
+		return false, err
+	}
+	for exceptionRows.Next() {
+		var date time.Time
+		var startClock, endClock string
+		if err := exceptionRows.Scan(&date, &startClock, &endClock); err != nil {
+			exceptionRows.Close()
+			return false, err
+		}
+		clockStart, err := time.Parse("15:04:05", startClock)
+		if err != nil {
+			exceptionRows.Close()
+			return false, err
+		}
+		clockEnd, err := time.Parse("15:04:05", endClock)
+		if err != nil {
+			exceptionRows.Close()
+			return false, err
+		}
+		dayStart := time.Date(date.Year(), date.Month(), date.Day(), clockStart.Hour(), clockStart.Minute(), 0, 0, start.Location())
+		dayEnd := time.Date(date.Year(), date.Month(), date.Day(), clockEnd.Hour(), clockEnd.Minute(), 0, 0, start.Location())
+		exceptions[date.Format("2006-01-02")] = struct {
+			start time.Time
+			end   time.Time
+		}{start: dayStart, end: dayEnd}
+		intervals = append(intervals, interval{dayStart, dayEnd})
+	}
+	if err := exceptionRows.Err(); err != nil {
+		exceptionRows.Close()
+		return false, err
+	}
+	exceptionRows.Close()
 	ruleRows, err := tx.Query(`
 		SELECT weekday, start_time::text, end_time::text
 		FROM availability_rules`)
 	if err != nil {
-	return false, err
+		return false, err
 	}
 	defer ruleRows.Close()
 	for ruleRows.Next() {
@@ -169,6 +214,9 @@ func hasAvailability(tx *sql.Tx, start time.Time, duration int) (bool, error) {
 		}
 		for day := start.AddDate(0, 0, -1); day.Before(end); day = day.AddDate(0, 0, 1) {
 			if int(day.Weekday()) == weekday {
+				if _, overridden := exceptions[day.Format("2006-01-02")]; overridden {
+					continue
+				}
 				dayStart := time.Date(day.Year(), day.Month(), day.Day(), clockStart.Hour(), clockStart.Minute(), 0, 0, start.Location())
 				dayEnd := time.Date(day.Year(), day.Month(), day.Day(), clockEnd.Hour(), clockEnd.Minute(), 0, 0, start.Location())
 				intervals = append(intervals, interval{dayStart, dayEnd})
@@ -417,6 +465,16 @@ func main() {
 		);`); err != nil {
 		log.Fatalf("❌ Erreur lors de la création des règles de disponibilité: %v", err)
 	}
+	if _, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS availability_exceptions (
+			id SERIAL PRIMARY KEY,
+			exception_date DATE NOT NULL UNIQUE,
+			start_time TIME NOT NULL,
+			end_time TIME NOT NULL,
+			CONSTRAINT availability_exception_range_valid CHECK (end_time > start_time)
+		);`); err != nil {
+		log.Fatalf("❌ Erreur lors de la création des exceptions de disponibilité: %v", err)
+	}
 
 	// S3 Garage
 	customResolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
@@ -590,6 +648,69 @@ func main() {
 			return
 		}
 		availabilities := []Availability{}
+		exceptions := make(map[string]struct {
+			id    int
+			start string
+			end   string
+		})
+		exceptionRows, err := db.Query(`
+			SELECT id, exception_date::text, start_time::text, end_time::text
+			FROM availability_exceptions
+			WHERE exception_date >= $1::date AND exception_date < $2::date`,
+			start, end,
+		)
+		if err != nil {
+			http.Error(w, "Erreur base de données", http.StatusInternalServerError)
+			return
+		}
+		for exceptionRows.Next() {
+			var id int
+			var date, startTime, endTime string
+			if err := exceptionRows.Scan(&id, &date, &startTime, &endTime); err != nil {
+				exceptionRows.Close()
+				http.Error(w, "Erreur base de données", http.StatusInternalServerError)
+				return
+			}
+			exceptions[date] = struct {
+				id    int
+				start string
+				end   string
+			}{id: id, start: startTime, end: endTime}
+		}
+		if err := exceptionRows.Err(); err != nil {
+			exceptionRows.Close()
+			http.Error(w, "Erreur base de données", http.StatusInternalServerError)
+			return
+		}
+		exceptionRows.Close()
+
+		for date, exception := range exceptions {
+			day, err := time.ParseInLocation("2006-01-02", date, start.Location())
+			if err != nil {
+				http.Error(w, "Date d'exception invalide", http.StatusInternalServerError)
+				return
+			}
+			exceptionStart, err := time.Parse("15:04:05", exception.start)
+			if err != nil {
+				http.Error(w, "Format d'horaire d'exception invalide", http.StatusInternalServerError)
+				return
+			}
+			exceptionEnd, err := time.Parse("15:04:05", exception.end)
+			if err != nil {
+				http.Error(w, "Format d'horaire d'exception invalide", http.StatusInternalServerError)
+				return
+			}
+			dayStart := time.Date(day.Year(), day.Month(), day.Day(), exceptionStart.Hour(), exceptionStart.Minute(), 0, 0, day.Location())
+			dayEnd := time.Date(day.Year(), day.Month(), day.Day(), exceptionEnd.Hour(), exceptionEnd.Minute(), 0, 0, day.Location())
+			for slot := dayStart; slot.Before(dayEnd); slot = slot.Add(15 * time.Minute) {
+				availabilities = append(availabilities, Availability{
+					ID: -exception.id, Exceptional: true, ExceptionID: exception.id,
+					RuleWeekday:   int(day.Weekday()),
+					ExceptionDate: date, RuleStart: exception.start, RuleEnd: exception.end,
+					Start: slot, End: slot.Add(15 * time.Minute),
+				})
+			}
+		}
 		ruleRows, err := db.Query(`
 			SELECT id, weekday, start_time::text, end_time::text
 			FROM availability_rules`)
@@ -606,6 +727,9 @@ func main() {
 			}
 			for day := start; day.Before(end); day = day.AddDate(0, 0, 1) {
 				if int(day.Weekday()) != rule.Weekday {
+					continue
+				}
+				if _, overridden := exceptions[day.Format("2006-01-02")]; overridden {
 					continue
 				}
 				ruleStart, err := time.Parse("15:04:05", rule.StartTime)
@@ -625,9 +749,10 @@ func main() {
 				for slot := dayStart; slot.Before(dayEnd); slot = slot.Add(15 * time.Minute) {
 					availabilities = append(availabilities, Availability{
 						ID: -rule.ID, Recurring: true, RuleID: rule.ID,
-						RuleStart: rule.StartTime, RuleEnd: rule.EndTime,
+						RuleWeekday: rule.Weekday,
+						RuleStart:   rule.StartTime, RuleEnd: rule.EndTime,
 						Start: slot,
-						End: slot.Add(15 * time.Minute),
+						End:   slot.Add(15 * time.Minute),
 					})
 				}
 			}
@@ -658,9 +783,9 @@ func main() {
 			return
 		}
 		var req struct {
-			Date      string `json:"date"`
-			Start     string `json:"start"`
-			End       string `json:"end"`
+			Date  string `json:"date"`
+			Start string `json:"start"`
+			End   string `json:"end"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "Requête invalide", http.StatusBadRequest)
@@ -697,6 +822,108 @@ func main() {
 		}
 		w.WriteHeader(http.StatusCreated)
 		json.NewEncoder(w).Encode(map[string]string{"message": "Règle de disponibilité ajoutée"})
+	})
+
+	mux.HandleFunc("POST /api/availability-exceptions", func(w http.ResponseWriter, r *http.Request) {
+		if err := authorizeAdmin(r); err != nil {
+			http.Error(w, err.Error(), http.StatusForbidden)
+			return
+		}
+		var req struct {
+			Date  string `json:"date"`
+			Start string `json:"start"`
+			End   string `json:"end"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Requête invalide", http.StatusBadRequest)
+			return
+		}
+		date, dateErr := time.Parse("2006-01-02", req.Date)
+		start, startErr := time.Parse("15:04", req.Start)
+		end, endErr := time.Parse("15:04", req.End)
+		if dateErr != nil || startErr != nil || endErr != nil || !end.After(start) ||
+			start.Minute()%15 != 0 || end.Minute()%15 != 0 || !date.After(time.Now().AddDate(0, 0, -1)) {
+			http.Error(w, "Date ou horaires invalides", http.StatusBadRequest)
+			return
+		}
+		_, err := db.Exec(`
+			INSERT INTO availability_exceptions (exception_date, start_time, end_time)
+			VALUES ($1, $2, $3)
+			ON CONFLICT (exception_date) DO UPDATE SET start_time = EXCLUDED.start_time, end_time = EXCLUDED.end_time`,
+			req.Date, req.Start, req.End,
+		)
+		if err != nil {
+			http.Error(w, "Erreur base de données", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(map[string]string{"message": "Disponibilité exceptionnelle ajoutée"})
+	})
+
+	mux.HandleFunc("PUT /api/availability-exceptions/{id}", func(w http.ResponseWriter, r *http.Request) {
+		if err := authorizeAdmin(r); err != nil {
+			http.Error(w, err.Error(), http.StatusForbidden)
+			return
+		}
+		id, err := strconv.Atoi(r.PathValue("id"))
+		if err != nil || id < 1 {
+			http.Error(w, "Identifiant invalide", http.StatusBadRequest)
+			return
+		}
+		var req struct {
+			Date  string `json:"date"`
+			Start string `json:"start"`
+			End   string `json:"end"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Requête invalide", http.StatusBadRequest)
+			return
+		}
+		date, dateErr := time.Parse("2006-01-02", req.Date)
+		start, startErr := time.Parse("15:04", req.Start)
+		end, endErr := time.Parse("15:04", req.End)
+		if dateErr != nil || startErr != nil || endErr != nil || !end.After(start) ||
+			start.Minute()%15 != 0 || end.Minute()%15 != 0 || !date.After(time.Now().AddDate(0, 0, -1)) {
+			http.Error(w, "Date ou horaires invalides", http.StatusBadRequest)
+			return
+		}
+		result, err := db.Exec(`
+			UPDATE availability_exceptions
+			SET exception_date = $1, start_time = $2, end_time = $3
+			WHERE id = $4`, req.Date, req.Start, req.End, id)
+		if err != nil {
+			http.Error(w, "Erreur base de données", http.StatusInternalServerError)
+			return
+		}
+		affected, _ := result.RowsAffected()
+		if affected == 0 {
+			http.Error(w, "Exception introuvable", http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	mux.HandleFunc("DELETE /api/availability-exceptions/{id}", func(w http.ResponseWriter, r *http.Request) {
+		if err := authorizeAdmin(r); err != nil {
+			http.Error(w, err.Error(), http.StatusForbidden)
+			return
+		}
+		id, err := strconv.Atoi(r.PathValue("id"))
+		if err != nil || id < 1 {
+			http.Error(w, "Identifiant invalide", http.StatusBadRequest)
+			return
+		}
+		result, err := db.Exec("DELETE FROM availability_exceptions WHERE id = $1", id)
+		if err != nil {
+			http.Error(w, "Erreur base de données", http.StatusInternalServerError)
+			return
+		}
+		affected, _ := result.RowsAffected()
+		if affected == 0 {
+			http.Error(w, "Exception introuvable", http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
 	})
 
 	mux.HandleFunc("PUT /api/availability-rules/{id}", func(w http.ResponseWriter, r *http.Request) {

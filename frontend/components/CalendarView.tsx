@@ -14,9 +14,13 @@ type Availability = {
   start: string;
   end: string;
   recurring: true;
+  exceptional?: boolean;
   rule_id: number;
+  rule_weekday: number;
   rule_start: string;
   rule_end: string;
+  exception_id?: number;
+  exception_date?: string;
 };
 
 export default function CalendarView({ isAdmin }: { isAdmin: boolean }) {
@@ -27,11 +31,13 @@ export default function CalendarView({ isAdmin }: { isAdmin: boolean }) {
   const [availabilityError, setAvailabilityError] = useState("");
   const [isAvailabilityModalOpen, setIsAvailabilityModalOpen] = useState(false);
   const [selectedAvailability, setSelectedAvailability] = useState<Availability | null>(null);
+  const [selectedAvailabilityDate, setSelectedAvailabilityDate] = useState("");
   const [availabilityEditForm, setAvailabilityEditForm] = useState({ start: "", end: "" });
   const [availabilityForm, setAvailabilityForm] = useState({
     date: new Date().toISOString().slice(0, 10),
     start: "08:00",
-    end: "19:45"
+    end: "23:00",
+    exceptional: false
   });
   
   // --- ÉTATS DE LA MODALE ---
@@ -42,7 +48,7 @@ export default function CalendarView({ isAdmin }: { isAdmin: boolean }) {
 
   const dayNames = ["Lun", "Mar", "Mer", "Jeu", "Ven", "Sam", "Dim"];
   const monthNames = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre", "octobre", "novembre", "décembre"];
-  const timeSlots = Array.from({ length: 56 }, (_, index) => {
+  const timeSlots = Array.from({ length: 60 }, (_, index) => {
     const totalMinutes = 8 * 60 + index * 15;
     return { hour: Math.floor(totalMinutes / 60), minute: totalMinutes % 60 };
   });
@@ -76,7 +82,7 @@ export default function CalendarView({ isAdmin }: { isAdmin: boolean }) {
     if (!token) return;
     try {
       const res = await fetch("http://localhost:8080/api/courses", {
-        headers: { "Authorization": `Bearer ${token}` }
+        headers: { "Authorization": "Bearer " + token }
       });
       if (res.ok) {
         const data = await res.json();
@@ -102,7 +108,7 @@ export default function CalendarView({ isAdmin }: { isAdmin: boolean }) {
       try {
         const res = await fetch(
           `http://localhost:8080/api/availability?start=${encodeURIComponent(start.toISOString())}&end=${encodeURIComponent(end.toISOString())}`,
-          { headers: { "Authorization": `Bearer ${token}` } }
+          { headers: { "Authorization": "Bearer " + token } }
         );
         if (res.ok) {
           setAvailabilities(await res.json());
@@ -140,28 +146,26 @@ export default function CalendarView({ isAdmin }: { isAdmin: boolean }) {
     setIsModalOpen(true);
   };
 
-  const getSlotStart = (day: Date, hour: number, minute: number) => {
-    const slot = new Date(day);
-    slot.setHours(hour, minute, 0, 0);
-    return slot;
-  };
-
   const isAvailable = (day: Date, hour: number, minute: number) => {
-    const slotStart = getSlotStart(day, hour, minute);
-    const slotEnd = new Date(slotStart.getTime() + 15 * 60 * 1000);
-    return availabilities.some((availability) =>
-      new Date(availability.start) <= slotStart &&
-      new Date(availability.end) >= slotEnd
-    );
+    const slotMinutes = hour * 60 + minute;
+    return availabilities.some((availability) => {
+      if (availability.rule_weekday !== day.getDay()) return false;
+      const [startHour, startMinute] = availability.rule_start.split(":").map(Number);
+      const [endHour, endMinute] = availability.rule_end.split(":").map(Number);
+      return slotMinutes >= startHour * 60 + startMinute &&
+        slotMinutes + 15 <= endHour * 60 + endMinute;
+    });
   };
 
   const openAvailabilityEditor = (day: Date, hour: number, minute: number) => {
-    const slotStart = getSlotStart(day, hour, minute);
     const availability = availabilities.find((item) =>
-      new Date(item.start) <= slotStart && new Date(item.end) >= new Date(slotStart.getTime() + 15 * 60 * 1000)
+      item.rule_weekday === day.getDay() &&
+      hour * 60 + minute >= Number(item.rule_start.slice(0, 2)) * 60 + Number(item.rule_start.slice(3, 5)) &&
+      hour * 60 + minute + 15 <= Number(item.rule_end.slice(0, 2)) * 60 + Number(item.rule_end.slice(3, 5))
     );
     if (!availability) return;
     setSelectedAvailability(availability);
+    setSelectedAvailabilityDate(`${day.getFullYear()}-${String(day.getMonth() + 1).padStart(2, "0")}-${String(day.getDate()).padStart(2, "0")}`);
     setAvailabilityEditForm({
       start: availability.rule_start.slice(0, 5),
       end: availability.rule_end.slice(0, 5)
@@ -175,7 +179,7 @@ export default function CalendarView({ isAdmin }: { isAdmin: boolean }) {
     end.setDate(end.getDate() + 7);
     const response = await fetch(
       `http://localhost:8080/api/availability?start=${encodeURIComponent(weekStart.toISOString())}&end=${encodeURIComponent(end.toISOString())}`,
-      { headers: { "Authorization": `Bearer ${token}` } }
+      { headers: { "Authorization": "Bearer " + token } }
     );
     if (response.ok) setAvailabilities(await response.json());
   };
@@ -185,11 +189,16 @@ export default function CalendarView({ isAdmin }: { isAdmin: boolean }) {
     if (!selectedAvailability) return;
     const token = localStorage.getItem("token");
     if (!token) return;
-    const endpoint = `http://localhost:8080/api/availability-rules/${selectedAvailability.rule_id}`;
+    const endpoint = selectedAvailability.exceptional
+      ? `http://localhost:8080/api/availability-exceptions/${selectedAvailability.exception_id}`
+      : `http://localhost:8080/api/availability-rules/${selectedAvailability.rule_id}`;
+    const body = selectedAvailability.exceptional
+      ? { date: selectedAvailabilityDate, start: availabilityEditForm.start, end: availabilityEditForm.end }
+      : { start: availabilityEditForm.start, end: availabilityEditForm.end };
     const response = await fetch(endpoint, {
       method: "PUT",
-      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
-      body: JSON.stringify({ start: availabilityEditForm.start, end: availabilityEditForm.end })
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
+      body: JSON.stringify(body)
     });
     if (!response.ok) {
       setAvailabilityError(await response.text() || "Impossible de modifier cette disponibilité.");
@@ -203,10 +212,12 @@ export default function CalendarView({ isAdmin }: { isAdmin: boolean }) {
     if (!selectedAvailability) return;
     const token = localStorage.getItem("token");
     if (!token) return;
-    const endpoint = `http://localhost:8080/api/availability-rules/${selectedAvailability.rule_id}`;
+    const endpoint = selectedAvailability.exceptional
+      ? `http://localhost:8080/api/availability-exceptions/${selectedAvailability.exception_id}`
+      : `http://localhost:8080/api/availability-rules/${selectedAvailability.rule_id}`;
     const response = await fetch(endpoint, {
       method: "DELETE",
-      headers: { "Authorization": `Bearer ${token}` }
+      headers: { "Authorization": "Bearer " + token }
     });
     if (!response.ok) {
       setAvailabilityError(await response.text() || "Impossible de supprimer cette disponibilité.");
@@ -222,11 +233,11 @@ export default function CalendarView({ isAdmin }: { isAdmin: boolean }) {
     if (!token) return;
     setAvailabilityError("");
     try {
-      const res = await fetch("http://localhost:8080/api/availability", {
+      const res = await fetch(`http://localhost:8080/api/${availabilityForm.exceptional ? "availability-exceptions" : "availability"}`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}`
+          "Authorization": "Bearer " + token,
         },
         body: JSON.stringify({
           date: availabilityForm.date,
@@ -243,12 +254,33 @@ export default function CalendarView({ isAdmin }: { isAdmin: boolean }) {
       end.setDate(end.getDate() + 7);
       const refreshed = await fetch(
         `http://localhost:8080/api/availability?start=${encodeURIComponent(weekStart.toISOString())}&end=${encodeURIComponent(end.toISOString())}`,
-        { headers: { "Authorization": `Bearer ${token}` } }
+        { headers: { "Authorization": "Bearer " + token } }
       );
       if (refreshed.ok) setAvailabilities(await refreshed.json());
     } catch {
       setAvailabilityError("Serveur injoignable.");
     }
+  };
+
+  const createExceptionForSelectedDay = async () => {
+    if (!selectedAvailability) return;
+    const token = localStorage.getItem("token");
+    if (!token) return;
+    const response = await fetch("http://localhost:8080/api/availability-exceptions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
+      body: JSON.stringify({
+        date: selectedAvailabilityDate,
+        start: availabilityEditForm.start,
+        end: availabilityEditForm.end
+      })
+    });
+    if (!response.ok) {
+      setAvailabilityError(await response.text() || "Impossible de créer l'exception.");
+      return;
+    }
+    setSelectedAvailability(null);
+    await refreshAvailabilities();
   };
 
   // Fonction pour déterminer la couleur selon le statut
@@ -278,7 +310,7 @@ export default function CalendarView({ isAdmin }: { isAdmin: boolean }) {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}`
+          "Authorization": "Bearer " + token,
         },
         body: JSON.stringify({
           title: formData.title,
@@ -375,8 +407,18 @@ export default function CalendarView({ isAdmin }: { isAdmin: boolean }) {
                   </label>
                 </div>
                 <p className="text-sm text-gray-400">
-                  Cette disponibilité sera répétée chaque semaine.
+                  {availabilityForm.exceptional
+                    ? "Cette disponibilité concerne uniquement la date choisie."
+                    : "Cette disponibilité sera répétée chaque semaine."}
                 </p>
+                <label className="flex items-center gap-2 text-sm text-gray-300">
+                  <input
+                    type="checkbox"
+                    checked={availabilityForm.exceptional}
+                    onChange={(event) => setAvailabilityForm({ ...availabilityForm, exceptional: event.target.checked })}
+                  />
+                  Disponibilité exceptionnelle
+                </label>
                 <div className="flex gap-3 pt-2">
                   <button type="button" onClick={() => setIsAvailabilityModalOpen(false)} className="flex-1 py-2 rounded-lg bg-gray-700 hover:bg-gray-600 font-bold">
                     Annuler
@@ -394,7 +436,7 @@ export default function CalendarView({ isAdmin }: { isAdmin: boolean }) {
             <form onSubmit={updateAvailability} className="bg-gray-800 border border-gray-700 p-6 rounded-xl shadow-2xl w-full max-w-md">
               <div className="flex justify-between items-center mb-5">
                 <h2 className="text-xl font-bold">
-                  Modifier la règle hebdomadaire
+                  {selectedAvailability.exceptional ? "Modifier l'exception" : "Modifier la règle hebdomadaire"}
                 </h2>
                 <button type="button" onClick={() => setSelectedAvailability(null)} className="text-gray-400 hover:text-white">&times;</button>
               </div>
@@ -413,6 +455,11 @@ export default function CalendarView({ isAdmin }: { isAdmin: boolean }) {
                 </label>
               </div>
               <div className="flex gap-3 pt-5">
+                {!selectedAvailability.exceptional && (
+                  <button type="button" onClick={createExceptionForSelectedDay} className="flex-1 py-2 rounded-lg bg-purple-700 hover:bg-purple-600 font-bold">
+                    Modifier ce jour
+                  </button>
+                )}
                 <button type="button" onClick={deleteAvailability} className="flex-1 py-2 rounded-lg bg-red-700 hover:bg-red-600 font-bold">
                   Supprimer
                 </button>
