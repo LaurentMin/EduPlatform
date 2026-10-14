@@ -27,6 +27,7 @@ export default function CalendarView({ isAdmin }: { isAdmin: boolean }) {
   // --- ÉTATS DU CALENDRIER ET DONNÉES ---
   const [currentDate, setCurrentDate] = useState(new Date());
   const [courses, setCourses] = useState<Course[]>([]);
+  const [occupiedCourses, setOccupiedCourses] = useState<Course[]>([]);
   const [availabilities, setAvailabilities] = useState<Availability[]>([]);
   const [availabilityError, setAvailabilityError] = useState("");
   const [isAvailabilityModalOpen, setIsAvailabilityModalOpen] = useState(false);
@@ -88,6 +89,12 @@ export default function CalendarView({ isAdmin }: { isAdmin: boolean }) {
         const data = await res.json();
         setCourses(data);
       }
+      const occupiedRes = await fetch("http://localhost:8080/api/courses/occupied", {
+        headers: { "Authorization": "Bearer " + token }
+      });
+      if (occupiedRes.ok) {
+        setOccupiedCourses(await occupiedRes.json());
+      }
     } catch (err) {
       console.error("Erreur lors de la récupération des cours", err);
     }
@@ -96,6 +103,8 @@ export default function CalendarView({ isAdmin }: { isAdmin: boolean }) {
   // Charger les cours au montage du composant
   useEffect(() => {
     fetchCourses();
+    const refreshTimer = window.setInterval(fetchCourses, 10000);
+    return () => window.clearInterval(refreshTimer);
   }, []);
 
   useEffect(() => {
@@ -154,6 +163,17 @@ export default function CalendarView({ isAdmin }: { isAdmin: boolean }) {
       const [endHour, endMinute] = availability.rule_end.split(":").map(Number);
       return slotMinutes >= startHour * 60 + startMinute &&
         slotMinutes + 15 <= endHour * 60 + endMinute;
+    });
+  };
+
+  const isOccupied = (day: Date, hour: number, minute: number) => {
+    const slotStart = new Date(day);
+    slotStart.setHours(hour, minute, 0, 0);
+    const slotEnd = new Date(slotStart.getTime() + 15 * 60 * 1000);
+    return occupiedCourses.some((course) => {
+      const courseStart = new Date(course.date);
+      const courseEnd = new Date(courseStart.getTime() + parseDuration(course.duration) * 60 * 1000);
+      return courseStart < slotEnd && slotStart < courseEnd;
     });
   };
 
@@ -501,15 +521,17 @@ export default function CalendarView({ isAdmin }: { isAdmin: boolean }) {
                     courseDate.getMinutes() === minute;
                 });
                 const available = isAvailable(day, hour, minute);
+                const occupied = isOccupied(day, hour, minute);
+                const bookable = available && !occupied;
                 return (
                   <button
                     key={`${day.toISOString()}-${hour}-${minute}`}
                     type="button"
                     onClick={() => isAdmin
                       ? available && openAvailabilityEditor(day, hour, minute)
-                      : available && handleSlotClick(day, hour, minute)}
+                      : bookable && handleSlotClick(day, hour, minute)}
                     className={`relative border-r border-b border-gray-700 transition-colors text-left ${
-                      available ? "bg-blue-500/10 hover:bg-blue-500/20" : "bg-gray-800/60"
+                      bookable ? "bg-blue-500/10 hover:bg-blue-500/20" : "bg-gray-800/60"
                     }`}
                     aria-label={`Réserver le ${formatDate(day)} à ${String(hour).padStart(2, "0")}h${String(minute).padStart(2, "0")}`}
                   >

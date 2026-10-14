@@ -995,6 +995,43 @@ func main() {
 	})
 
 	// Récupérer la liste des cours (Protéger par JWT)
+	mux.HandleFunc("GET /api/courses/occupied", func(w http.ResponseWriter, r *http.Request) {
+		tokenString := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		claims := &Claims{}
+		token, _ := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) { return jwtKey, nil })
+		if token == nil || !token.Valid {
+			http.Error(w, "Non autorisé", http.StatusUnauthorized)
+			return
+		}
+		rows, err := db.Query(`
+			SELECT id, scheduled_at, duration
+			FROM courses
+			WHERE status NOT IN ('réalisé', 'realise')
+			ORDER BY scheduled_at`)
+		if err != nil {
+			http.Error(w, "Erreur base de données", http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+		occupied := []Course{}
+		for rows.Next() {
+			var course Course
+			var scheduledAt time.Time
+			if err := rows.Scan(&course.ID, &scheduledAt, &course.Duration); err != nil {
+				http.Error(w, "Erreur base de données", http.StatusInternalServerError)
+				return
+			}
+			course.ScheduledAt = scheduledAt.Format(time.RFC3339)
+			occupied = append(occupied, course)
+		}
+		if err := rows.Err(); err != nil {
+			http.Error(w, "Erreur base de données", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(occupied)
+	})
+
 	mux.HandleFunc("GET /api/courses", func(w http.ResponseWriter, r *http.Request) {
 		tokenString := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		claims := &Claims{}
