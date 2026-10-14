@@ -9,10 +9,25 @@ type Course = {
   status: string;
 };
 
-export default function CalendarView() {
+type Availability = {
+  id: number;
+  start: string;
+  end: string;
+};
+
+export default function CalendarView({ isAdmin }: { isAdmin: boolean }) {
   // --- ÉTATS DU CALENDRIER ET DONNÉES ---
   const [currentDate, setCurrentDate] = useState(new Date());
   const [courses, setCourses] = useState<Course[]>([]);
+  const [availabilities, setAvailabilities] = useState<Availability[]>([]);
+  const [availabilityError, setAvailabilityError] = useState("");
+  const [isAvailabilityModalOpen, setIsAvailabilityModalOpen] = useState(false);
+  const [availabilityForm, setAvailabilityForm] = useState({
+    date: new Date().toISOString().slice(0, 10),
+    start: "08:00",
+    end: "19:45",
+    recurring: false
+  });
   
   // --- ÉTATS DE LA MODALE ---
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -22,7 +37,10 @@ export default function CalendarView() {
 
   const dayNames = ["Lun", "Mar", "Mer", "Jeu", "Ven", "Sam", "Dim"];
   const monthNames = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre", "octobre", "novembre", "décembre"];
-  const hours = Array.from({ length: 15 }, (_, index) => index + 8);
+  const timeSlots = Array.from({ length: 56 }, (_, index) => {
+    const totalMinutes = 8 * 60 + index * 15;
+    return { hour: Math.floor(totalMinutes / 60), minute: totalMinutes % 60 };
+  });
   const startOfWeek = (date: Date) => {
     const result = new Date(date);
     const day = result.getDay();
@@ -32,6 +50,7 @@ export default function CalendarView() {
     return result;
   };
   const weekStart = startOfWeek(currentDate);
+  const weekStartKey = weekStart.toISOString();
   const weekDays = Array.from({ length: 7 }, (_, index) => {
     const day = new Date(weekStart);
     day.setDate(weekStart.getDate() + index);
@@ -68,6 +87,30 @@ export default function CalendarView() {
     fetchCourses();
   }, []);
 
+  useEffect(() => {
+    const fetchAvailability = async () => {
+      const token = localStorage.getItem("token");
+      if (!token) return;
+      const start = new Date(weekStartKey);
+      const end = new Date(start);
+      end.setDate(end.getDate() + 7);
+      try {
+        const res = await fetch(
+          `http://localhost:8080/api/availability?start=${encodeURIComponent(start.toISOString())}&end=${encodeURIComponent(end.toISOString())}`,
+          { headers: { "Authorization": `Bearer ${token}` } }
+        );
+        if (res.ok) {
+          setAvailabilities(await res.json());
+        } else {
+          setAvailabilityError(await res.text() || "Impossible de charger les disponibilités.");
+        }
+      } catch {
+        setAvailabilityError("Impossible de charger les disponibilités.");
+      }
+    };
+    fetchAvailability();
+  }, [weekStartKey]);
+
   // --- HELPERS ---
   const previousWeek = () => {
     const date = new Date(currentDate);
@@ -80,16 +123,62 @@ export default function CalendarView() {
     setCurrentDate(date);
   };
 
-  const handleSlotClick = (day: Date, hour: number) => {
+  const handleSlotClick = (day: Date, hour: number, minute: number) => {
     const selected = new Date(day);
-    selected.setHours(hour, 0, 0, 0);
+    selected.setHours(hour, minute, 0, 0);
     setSelectedDate(selected);
     setFormData((previous) => ({
       ...previous,
-      time: `${String(hour).padStart(2, "0")}:00`
+      time: `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`
     }));
     setSuccessMsg("");
     setIsModalOpen(true);
+  };
+
+  const getSlotStart = (day: Date, hour: number, minute: number) => {
+    const slot = new Date(day);
+    slot.setHours(hour, minute, 0, 0);
+    return slot;
+  };
+
+  const isAvailable = (day: Date, hour: number, minute: number) => {
+    const slotStart = getSlotStart(day, hour, minute);
+    const slotEnd = new Date(slotStart.getTime() + 15 * 60 * 1000);
+    return availabilities.some((availability) =>
+      new Date(availability.start) <= slotStart &&
+      new Date(availability.end) >= slotEnd
+    );
+  };
+
+  const addAvailability = async (event: React.FormEvent) => {
+    event.preventDefault();
+    const token = localStorage.getItem("token");
+    if (!token) return;
+    setAvailabilityError("");
+    try {
+      const res = await fetch("http://localhost:8080/api/availability", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`
+        },
+        body: JSON.stringify(availabilityForm)
+      });
+      if (!res.ok) {
+        setAvailabilityError(await res.text() || "Impossible d'ajouter cette disponibilité.");
+        return;
+      }
+      setIsAvailabilityModalOpen(false);
+      const end = new Date(weekStart);
+      end.setDate(end.getDate() + 7);
+      const refreshed = await fetch(
+        `http://localhost:8080/api/availability?start=${encodeURIComponent(weekStart.toISOString())}&end=${encodeURIComponent(end.toISOString())}`,
+        { headers: { "Authorization": `Bearer ${token}` } }
+      );
+      if (refreshed.ok) setAvailabilities(await refreshed.json());
+    } catch {
+      setAvailabilityError("Serveur injoignable.");
+    }
   };
 
   // Fonction pour déterminer la couleur selon le statut
@@ -140,7 +229,7 @@ export default function CalendarView() {
         const message = await res.text();
         setSuccessMsg(`❌ ${message || "Erreur lors de la réservation."}`);
       }
-    } catch (err) {
+    } catch {
       setSuccessMsg("❌ Serveur injoignable.");
     }
   };
@@ -148,7 +237,16 @@ export default function CalendarView() {
   return (
     <div className="h-full flex flex-col max-w-5xl mx-auto w-full relative">
       <div className="flex justify-between items-center mb-6">
-        <h1 className="text-3xl font-bold">Réserver un créneau</h1>
+        <h1 className="text-3xl font-bold">{isAdmin ? "Mes disponibilités" : "Réserver un créneau"}</h1>
+        {isAdmin && (
+          <button
+            type="button"
+            onClick={() => setIsAvailabilityModalOpen(true)}
+            className="bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded-lg font-bold"
+          >
+            + Ajouter
+          </button>
+        )}
         <div className="flex items-center gap-4 bg-gray-800 p-2 rounded-lg border border-gray-700">
           <button onClick={previousWeek} className="px-3 py-1 hover:bg-gray-700 rounded transition-colors">&larr;</button>
           <span className="font-bold min-w-[230px] text-center">
@@ -156,6 +254,76 @@ export default function CalendarView() {
           </span>
           <button onClick={nextWeek} className="px-3 py-1 hover:bg-gray-700 rounded transition-colors">&rarr;</button>
         </div>
+        {isAdmin && (
+          <p className="text-sm text-gray-400 mb-3">
+            Utilisez le bouton « Ajouter » pour définir une disponibilité ponctuelle ou récurrente.
+          </p>
+        )}
+        {availabilityError && (
+          <p className="text-red-400 bg-red-900/20 p-3 rounded-lg mb-3">{availabilityError}</p>
+        )}
+        {isAvailabilityModalOpen && (
+          <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center backdrop-blur-sm">
+            <form onSubmit={addAvailability} className="bg-gray-800 border border-gray-700 p-6 rounded-xl shadow-2xl w-full max-w-md">
+              <div className="flex justify-between items-center mb-5">
+                <h2 className="text-xl font-bold">Ajouter une disponibilité</h2>
+                <button type="button" onClick={() => setIsAvailabilityModalOpen(false)} className="text-gray-400 hover:text-white">&times;</button>
+              </div>
+              <div className="flex flex-col gap-4">
+                <label className="text-sm text-gray-300">
+                  Date
+                  <input
+                    type="date"
+                    required
+                    value={availabilityForm.date}
+                    onChange={(event) => setAvailabilityForm({ ...availabilityForm, date: event.target.value })}
+                    className="mt-1 w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-white"
+                  />
+                </label>
+                <div className="flex gap-3">
+                  <label className="flex-1 text-sm text-gray-300">
+                    Début
+                    <input
+                      type="time"
+                      step="900"
+                      required
+                      value={availabilityForm.start}
+                      onChange={(event) => setAvailabilityForm({ ...availabilityForm, start: event.target.value })}
+                      className="mt-1 w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-white"
+                    />
+                  </label>
+                  <label className="flex-1 text-sm text-gray-300">
+                    Fin
+                    <input
+                      type="time"
+                      step="900"
+                      required
+                      value={availabilityForm.end}
+                      onChange={(event) => setAvailabilityForm({ ...availabilityForm, end: event.target.value })}
+                      className="mt-1 w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-white"
+                    />
+                  </label>
+                </div>
+                <label className="flex items-center gap-2 text-sm text-gray-300">
+                  <input
+                    type="checkbox"
+                    checked={availabilityForm.recurring}
+                    onChange={(event) => setAvailabilityForm({ ...availabilityForm, recurring: event.target.checked })}
+                  />
+                  Répéter toutes les semaines
+                </label>
+                <div className="flex gap-3 pt-2">
+                  <button type="button" onClick={() => setIsAvailabilityModalOpen(false)} className="flex-1 py-2 rounded-lg bg-gray-700 hover:bg-gray-600 font-bold">
+                    Annuler
+                  </button>
+                  <button type="submit" className="flex-1 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 font-bold">
+                    Ajouter
+                  </button>
+                </div>
+              </div>
+            </form>
+          </div>
+        )}
       </div>
 
       <div className="flex-1 min-h-0 bg-gray-800 border border-gray-700 rounded-xl shadow-lg overflow-auto">
@@ -174,30 +342,35 @@ export default function CalendarView() {
             })}
           </div>
 
-          {hours.map((hour) => (
-            <div key={hour} className="grid grid-cols-[64px_repeat(7,minmax(115px,1fr))] min-h-[64px]">
+          {timeSlots.map(({ hour, minute }) => (
+            <div key={`${hour}-${minute}`} className="grid grid-cols-[64px_repeat(7,minmax(115px,1fr))] min-h-[16px]">
               <div className="border-r border-b border-gray-700 px-2 pt-1 text-xs text-gray-400 text-right">
-                {String(hour).padStart(2, "0")}h
+                {minute === 0 ? `${String(hour).padStart(2, "0")}h` : ""}
               </div>
               {weekDays.map((day) => {
                 const dayCourses = courses.filter((course) => {
                   const courseDate = new Date(course.date);
                   return courseDate.toDateString() === day.toDateString() &&
-                    courseDate.getHours() === hour;
+                    courseDate.getHours() === hour &&
+                    courseDate.getMinutes() === minute;
                 });
+                const available = isAvailable(day, hour, minute);
                 return (
                   <button
-                    key={`${day.toISOString()}-${hour}`}
+                    key={`${day.toISOString()}-${hour}-${minute}`}
                     type="button"
-                    onClick={() => handleSlotClick(day, hour)}
-                    className="relative border-r border-b border-gray-700 bg-gray-800/60 hover:bg-blue-500/10 transition-colors text-left"
-                    aria-label={`Réserver le ${formatDate(day)} à ${String(hour).padStart(2, "0")}h`}
+                    onClick={() => !isAdmin && available && handleSlotClick(day, hour, minute)}
+                    disabled={isAdmin || !available}
+                    className={`relative border-r border-b border-gray-700 transition-colors text-left ${
+                      available ? "bg-blue-500/10 hover:bg-blue-500/20" : "bg-gray-800/60"
+                    }`}
+                    aria-label={`Réserver le ${formatDate(day)} à ${String(hour).padStart(2, "0")}h${String(minute).padStart(2, "0")}`}
                   >
                     {dayCourses.map((course) => (
                       <div
                         key={course.id}
                         className={`absolute inset-x-1 top-1 z-[1] rounded border p-1.5 text-xs overflow-hidden shadow ${getStatusStyle(course.status)}`}
-                        style={{ height: `${Math.max(48, parseDuration(course.duration) * 64 / 60 - 8)}px` }}
+                        style={{ height: `${Math.max(32, parseDuration(course.duration) * 16 / 15 - 4)}px` }}
                         title={`${formatTime(new Date(course.date))} - ${course.title} (${course.status})`}
                         onClick={(event) => event.stopPropagation()}
                       >
@@ -206,6 +379,9 @@ export default function CalendarView() {
                         <div className="truncate opacity-75">{course.duration}</div>
                       </div>
                     ))}
+                    {isAdmin && available && dayCourses.length === 0 && (
+                      <span className="absolute bottom-1 right-1 text-[10px] text-blue-300">Disponible</span>
+                    )}
                   </button>
                 );
               })}
