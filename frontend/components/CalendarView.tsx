@@ -16,16 +16,35 @@ export default function CalendarView() {
   
   // --- ÉTATS DE LA MODALE ---
   const [isModalOpen, setIsModalOpen] = useState(false);
-  const [selectedDay, setSelectedDay] = useState<number | null>(null);
+  const [selectedDate, setSelectedDate] = useState<Date | null>(null);
   const [formData, setFormData] = useState({ title: "", time: "14:00", duration: "1h" });
   const [successMsg, setSuccessMsg] = useState("");
 
-  const year = currentDate.getFullYear();
-  const month = currentDate.getMonth();
-  const daysInMonth = new Date(year, month + 1, 0).getDate();
-  const firstDayOfMonth = new Date(year, month, 1).getDay();
-  const emptyDaysOffset = firstDayOfMonth === 0 ? 6 : firstDayOfMonth - 1;
-  const monthNames = ["Janvier", "Février", "Mars", "Avril", "Mai", "Juin", "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre"];
+  const dayNames = ["Lun", "Mar", "Mer", "Jeu", "Ven", "Sam", "Dim"];
+  const monthNames = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre", "octobre", "novembre", "décembre"];
+  const hours = Array.from({ length: 15 }, (_, index) => index + 8);
+  const startOfWeek = (date: Date) => {
+    const result = new Date(date);
+    const day = result.getDay();
+    const mondayOffset = day === 0 ? -6 : 1 - day;
+    result.setDate(result.getDate() + mondayOffset);
+    result.setHours(0, 0, 0, 0);
+    return result;
+  };
+  const weekStart = startOfWeek(currentDate);
+  const weekDays = Array.from({ length: 7 }, (_, index) => {
+    const day = new Date(weekStart);
+    day.setDate(weekStart.getDate() + index);
+    return day;
+  });
+  const formatDate = (date: Date) =>
+    `${date.getDate()} ${monthNames[date.getMonth()]} ${date.getFullYear()}`;
+  const formatTime = (date: Date) =>
+    date.toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" }).replace(":", "h");
+  const parseDuration = (duration: string) => {
+    const match = duration.match(/(\d+)h(?:(\d+))?/i);
+    return match ? Number(match[1]) * 60 + Number(match[2] || 0) : 60;
+  };
 
   // --- RÉCUPÉRATION DES COURS DEPUIS L'API ---
   const fetchCourses = async () => {
@@ -50,11 +69,25 @@ export default function CalendarView() {
   }, []);
 
   // --- HELPERS ---
-  const prevMonth = () => setCurrentDate(new Date(year, month - 1, 1));
-  const nextMonth = () => setCurrentDate(new Date(year, month + 1, 1));
+  const previousWeek = () => {
+    const date = new Date(currentDate);
+    date.setDate(date.getDate() - 7);
+    setCurrentDate(date);
+  };
+  const nextWeek = () => {
+    const date = new Date(currentDate);
+    date.setDate(date.getDate() + 7);
+    setCurrentDate(date);
+  };
 
-  const handleDayClick = (day: number) => {
-    setSelectedDay(day);
+  const handleSlotClick = (day: Date, hour: number) => {
+    const selected = new Date(day);
+    selected.setHours(hour, 0, 0, 0);
+    setSelectedDate(selected);
+    setFormData((previous) => ({
+      ...previous,
+      time: `${String(hour).padStart(2, "0")}:00`
+    }));
     setSuccessMsg("");
     setIsModalOpen(true);
   };
@@ -75,10 +108,11 @@ export default function CalendarView() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     const token = localStorage.getItem("token");
-    if (!selectedDay || !token) return;
+    if (!selectedDate || !token) return;
 
     const [hours, minutes] = formData.time.split(':').map(Number);
-    const scheduledDate = new Date(year, month, selectedDay, hours, minutes);
+    const scheduledDate = new Date(selectedDate);
+    scheduledDate.setHours(hours, minutes, 0, 0);
 
     try {
       const res = await fetch("http://localhost:8080/api/courses", {
@@ -116,65 +150,67 @@ export default function CalendarView() {
       <div className="flex justify-between items-center mb-6">
         <h1 className="text-3xl font-bold">Réserver un créneau</h1>
         <div className="flex items-center gap-4 bg-gray-800 p-2 rounded-lg border border-gray-700">
-          <button onClick={prevMonth} className="px-3 py-1 hover:bg-gray-700 rounded transition-colors">&larr;</button>
-          <span className="font-bold min-w-[120px] text-center">
-            {monthNames[month]} {year}
+          <button onClick={previousWeek} className="px-3 py-1 hover:bg-gray-700 rounded transition-colors">&larr;</button>
+          <span className="font-bold min-w-[230px] text-center">
+            Semaine du {formatDate(weekStart)}
           </span>
-          <button onClick={nextMonth} className="px-3 py-1 hover:bg-gray-700 rounded transition-colors">&rarr;</button>
+          <button onClick={nextWeek} className="px-3 py-1 hover:bg-gray-700 rounded transition-colors">&rarr;</button>
         </div>
       </div>
 
-      <div className="flex-1 bg-gray-800 border border-gray-700 rounded-xl p-6 shadow-lg flex flex-col">
-        <div className="grid grid-cols-7 gap-2 mb-4 text-center font-bold text-gray-400">
-          <div>Lun</div><div>Mar</div><div>Mer</div><div>Jeu</div><div>Ven</div><div>Sam</div><div>Dim</div>
-        </div>
-
-        <div className="grid grid-cols-7 gap-2 flex-1 auto-rows-fr">
-          {Array.from({ length: emptyDaysOffset }).map((_, i) => (
-            <div key={`empty-${i}`} className="bg-gray-800/50 rounded-lg border border-gray-700/50 opacity-50"></div>
-          ))}
-          
-          {Array.from({ length: daysInMonth }).map((_, i) => {
-            const day = i + 1;
-            const isToday = day === new Date().getDate() && month === new Date().getMonth() && year === new Date().getFullYear();
-            
-            // Filtrer les cours qui tombent ce jour-là
-            const dayCourses = courses.filter(c => {
-              const cDate = new Date(c.date);
-              return cDate.getDate() === day && cDate.getMonth() === month && cDate.getFullYear() === year;
-            });
-
-            return (
-              <button
-                key={day}
-                onClick={() => handleDayClick(day)}
-                className={`relative p-2 rounded-lg border flex flex-col items-start justify-start transition-all hover:border-blue-500 hover:bg-gray-700 group min-h-[100px] overflow-hidden
-                  ${isToday ? 'border-blue-500 bg-blue-500/10' : 'border-gray-700 bg-gray-750'}`}
-              >
-                <span className={`font-bold mb-1 ${isToday ? 'text-blue-400' : 'text-gray-300 group-hover:text-white'}`}>{day}</span>
-                
-                {/* AFFICHAGE DES COURS DU JOUR */}
-                <div className="flex flex-col w-full gap-1 overflow-y-auto no-scrollbar">
-                  {dayCourses.map(course => {
-                    const courseTime = new Date(course.date).toLocaleTimeString("fr-FR", { hour: '2-digit', minute: '2-digit' }).replace(':', 'h');
-                    return (
-                      <div 
-                        key={course.id} 
-                        className={`text-[10px] w-full text-left px-1.5 py-1 rounded border truncate shadow-sm ${getStatusStyle(course.status)}`}
-                        title={`${courseTime} - ${course.title} (${course.status})`} // Tooltip au survol
-                      >
-                        <span className="font-bold">{courseTime}</span> - {course.title}
-                      </div>
-                    );
-                  })}
+      <div className="flex-1 min-h-0 bg-gray-800 border border-gray-700 rounded-xl shadow-lg overflow-auto">
+        <div className="min-w-[900px]">
+          <div className="grid grid-cols-[64px_repeat(7,minmax(115px,1fr))] border-b border-gray-700 sticky top-0 z-10 bg-gray-800">
+            <div className="border-r border-gray-700" />
+            {weekDays.map((day, index) => {
+              const today = new Date();
+              const isToday = day.toDateString() === today.toDateString();
+              return (
+                <div key={day.toISOString()} className={`p-3 text-center border-r border-gray-700 ${isToday ? "bg-blue-500/10" : ""}`}>
+                  <div className="text-xs text-gray-400 uppercase">{dayNames[index]}</div>
+                  <div className={`text-lg font-bold ${isToday ? "text-blue-400" : "text-white"}`}>{day.getDate()}</div>
                 </div>
+              );
+            })}
+          </div>
 
-                <span className="text-[10px] text-gray-500 mt-auto pt-1 opacity-0 group-hover:opacity-100 transition-opacity w-full text-center">
-                  + Réserver
-                </span>
-              </button>
-            );
-          })}
+          {hours.map((hour) => (
+            <div key={hour} className="grid grid-cols-[64px_repeat(7,minmax(115px,1fr))] min-h-[64px]">
+              <div className="border-r border-b border-gray-700 px-2 pt-1 text-xs text-gray-400 text-right">
+                {String(hour).padStart(2, "0")}h
+              </div>
+              {weekDays.map((day) => {
+                const dayCourses = courses.filter((course) => {
+                  const courseDate = new Date(course.date);
+                  return courseDate.toDateString() === day.toDateString() &&
+                    courseDate.getHours() === hour;
+                });
+                return (
+                  <button
+                    key={`${day.toISOString()}-${hour}`}
+                    type="button"
+                    onClick={() => handleSlotClick(day, hour)}
+                    className="relative border-r border-b border-gray-700 bg-gray-800/60 hover:bg-blue-500/10 transition-colors text-left"
+                    aria-label={`Réserver le ${formatDate(day)} à ${String(hour).padStart(2, "0")}h`}
+                  >
+                    {dayCourses.map((course) => (
+                      <div
+                        key={course.id}
+                        className={`absolute inset-x-1 top-1 z-[1] rounded border p-1.5 text-xs overflow-hidden shadow ${getStatusStyle(course.status)}`}
+                        style={{ height: `${Math.max(48, parseDuration(course.duration) * 64 / 60 - 8)}px` }}
+                        title={`${formatTime(new Date(course.date))} - ${course.title} (${course.status})`}
+                        onClick={(event) => event.stopPropagation()}
+                      >
+                        <div className="font-bold truncate">{formatTime(new Date(course.date))}</div>
+                        <div className="truncate">{course.title}</div>
+                        <div className="truncate opacity-75">{course.duration}</div>
+                      </div>
+                    ))}
+                  </button>
+                );
+              })}
+            </div>
+          ))}
         </div>
       </div>
 
@@ -188,7 +224,7 @@ export default function CalendarView() {
             </div>
 
             <p className="text-gray-400 mb-6">
-              Pour le <strong className="text-white">{selectedDay} {monthNames[month]} {year}</strong>
+              Pour le <strong className="text-white">{selectedDate && formatDate(selectedDate)}</strong>
             </p>
 
             {successMsg ? (
