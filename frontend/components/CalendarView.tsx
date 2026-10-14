@@ -103,7 +103,8 @@ export default function CalendarView() {
           setFormData({ title: "", time: "14:00", duration: "1h" });
         }, 1500);
       } else {
-        setSuccessMsg("❌ Erreur lors de la réservation.");
+        const message = await res.text();
+        setSuccessMsg(`❌ ${message || "Erreur lors de la réservation."}`);
       }
     } catch (err) {
       setSuccessMsg("❌ Serveur injoignable.");

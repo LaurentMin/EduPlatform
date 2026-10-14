@@ -4,9 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -44,6 +46,63 @@ type Course struct {
 	Duration    string  `json:"duration"`
 	Status      string  `json:"status"`
 	Price       float64 `json:"price"`
+}
+
+var durationPattern = regexp.MustCompile(`(?i)^\s*(\d+)\s*h\s*(?:(\d+)\s*m)?\s*$`)
+
+func durationMinutes(value string) (int, error) {
+	matches := durationPattern.FindStringSubmatch(value)
+	if matches == nil {
+		return 0, fmt.Errorf("durée invalide")
+	}
+	hours, err := strconv.Atoi(matches[1])
+	if err != nil || hours < 0 {
+		return 0, fmt.Errorf("durée invalide")
+	}
+	minutes := 0
+	if matches[2] != "" {
+		minutes, err = strconv.Atoi(matches[2])
+		if err != nil || minutes > 59 {
+			return 0, fmt.Errorf("durée invalide")
+		}
+	}
+	total := hours*60 + minutes
+	if total <= 0 {
+		return 0, fmt.Errorf("durée invalide")
+	}
+	return total, nil
+}
+
+func hasScheduleConflict(tx *sql.Tx, courseID int, start time.Time, duration int) (bool, error) {
+	rows, err := tx.Query(`
+		SELECT id, scheduled_at, duration
+		FROM courses
+		WHERE id <> $1
+		  AND status NOT IN ('réalisé', 'realise')
+		FOR UPDATE`, courseID)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+
+	end := start.Add(time.Duration(duration) * time.Minute)
+	for rows.Next() {
+		var existingID int
+		var existingStart time.Time
+		var existingDuration string
+		if err := rows.Scan(&existingID, &existingStart, &existingDuration); err != nil {
+			return false, err
+		}
+		existingMinutes, err := durationMinutes(existingDuration)
+		if err != nil {
+			return false, fmt.Errorf("durée du cours %d invalide: %w", existingID, err)
+		}
+		existingEnd := existingStart.Add(time.Duration(existingMinutes) * time.Minute)
+		if start.Before(existingEnd) && existingStart.Before(end) {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 type Message struct {
@@ -344,11 +403,45 @@ func main() {
 			http.Error(w, "Requête invalide", http.StatusBadRequest)
 			return
 		}
-
-		// 3. Insérer en base de données avec l'ID du client (récupéré depuis le token)
-		query := `INSERT INTO courses (client_id, title, scheduled_at, duration) VALUES ($1, $2, $3, $4)`
-		_, err = db.Exec(query, claims.UserID, req.Title, req.Date, req.Duration)
+		scheduledAt, err := time.Parse(time.RFC3339, req.Date)
+		if err != nil || !scheduledAt.After(time.Now()) {
+			http.Error(w, "La date doit être valide et dans le futur", http.StatusBadRequest)
+			return
+		}
+		duration, err := durationMinutes(req.Duration)
 		if err != nil {
+			http.Error(w, "La durée du cours est invalide", http.StatusBadRequest)
+			return
+		}
+
+		tx, err := db.Begin()
+		if err != nil {
+			http.Error(w, "Erreur base de données", http.StatusInternalServerError)
+			return
+		}
+		conflict, err := hasScheduleConflict(tx, 0, scheduledAt, duration)
+		if err != nil {
+			tx.Rollback()
+			http.Error(w, "Erreur base de données", http.StatusInternalServerError)
+			return
+		}
+		if conflict {
+			tx.Rollback()
+			http.Error(w, "Ce créneau est déjà occupé", http.StatusConflict)
+			return
+		}
+
+		_, err = tx.Exec(
+			`INSERT INTO courses (client_id, title, scheduled_at, duration)
+			 VALUES ($1, $2, $3, $4)`,
+			claims.UserID, req.Title, scheduledAt, req.Duration,
+		)
+		if err != nil {
+			tx.Rollback()
+			http.Error(w, "Erreur base de données", http.StatusInternalServerError)
+			return
+		}
+		if err := tx.Commit(); err != nil {
 			http.Error(w, "Erreur base de données", http.StatusInternalServerError)
 			return
 		}
@@ -422,27 +515,176 @@ func main() {
 			http.Error(w, "Identifiant de cours invalide", http.StatusBadRequest)
 			return
 		}
-		result, err := db.Exec(
+		tx, err := db.Begin()
+		if err != nil {
+			http.Error(w, "Erreur base de données", http.StatusInternalServerError)
+			return
+		}
+		var scheduledAt time.Time
+		var courseDuration string
+		err = tx.QueryRow(
+			"SELECT scheduled_at, duration FROM courses WHERE id = $1 AND status = 'demandé' FOR UPDATE",
+			courseID,
+		).Scan(&scheduledAt, &courseDuration)
+		if err == sql.ErrNoRows {
+			tx.Rollback()
+			http.Error(w, "Demande introuvable ou déjà traitée", http.StatusConflict)
+			return
+		}
+		if err != nil {
+			tx.Rollback()
+			http.Error(w, "Erreur base de données", http.StatusInternalServerError)
+			return
+		}
+		duration, err := durationMinutes(courseDuration)
+		if err != nil {
+			tx.Rollback()
+			http.Error(w, "Durée du cours invalide", http.StatusInternalServerError)
+			return
+		}
+		conflict, err := hasScheduleConflict(tx, courseID, scheduledAt, duration)
+		if err != nil {
+			tx.Rollback()
+			http.Error(w, "Erreur base de données", http.StatusInternalServerError)
+			return
+		}
+		if conflict {
+			tx.Rollback()
+			http.Error(w, "Impossible d'accepter: ce créneau est déjà occupé", http.StatusConflict)
+			return
+		}
+		result, err := tx.Exec(
 			"UPDATE courses SET status = 'confirmé' WHERE id = $1 AND status = 'demandé'",
 			courseID,
 		)
 		if err != nil {
+			tx.Rollback()
 			http.Error(w, "Erreur base de données", http.StatusInternalServerError)
 			return
 		}
 
 		rowsAffected, err := result.RowsAffected()
 		if err != nil {
+			tx.Rollback()
 			http.Error(w, "Erreur base de données", http.StatusInternalServerError)
 			return
 		}
 		if rowsAffected == 0 {
+			tx.Rollback()
 			http.Error(w, "Demande introuvable ou déjà traitée", http.StatusConflict)
+			return
+		}
+		if err := tx.Commit(); err != nil {
+			http.Error(w, "Erreur base de données", http.StatusInternalServerError)
 			return
 		}
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"message": "Cours accepté"})
+	})
+
+	// Reprogrammer un cours à venir (réservé au professeur)
+	mux.HandleFunc("PUT /api/courses/{id}/reschedule", func(w http.ResponseWriter, r *http.Request) {
+		tokenString := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		claims := &Claims{}
+		token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) {
+			return jwtKey, nil
+		})
+		if token == nil || err != nil || !token.Valid {
+			http.Error(w, "Non autorisé", http.StatusUnauthorized)
+			return
+		}
+		if claims.Email != adminEmail {
+			http.Error(w, "Accès réservé au professeur", http.StatusForbidden)
+			return
+		}
+
+		courseID, err := strconv.Atoi(r.PathValue("id"))
+		if err != nil || courseID < 1 {
+			http.Error(w, "Identifiant de cours invalide", http.StatusBadRequest)
+			return
+		}
+
+		var req struct {
+			Date string `json:"date"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Requête invalide", http.StatusBadRequest)
+			return
+		}
+		scheduledAt, err := time.Parse(time.RFC3339, req.Date)
+		if err != nil || !scheduledAt.After(time.Now()) {
+			http.Error(w, "La nouvelle date doit être valide et dans le futur", http.StatusBadRequest)
+			return
+		}
+
+		tx, err := db.Begin()
+		if err != nil {
+			http.Error(w, "Erreur base de données", http.StatusInternalServerError)
+			return
+		}
+		var currentDuration string
+		err = tx.QueryRow(
+			"SELECT duration FROM courses WHERE id = $1 AND status NOT IN ('réalisé', 'realise') FOR UPDATE",
+			courseID,
+		).Scan(&currentDuration)
+		if err == sql.ErrNoRows {
+			tx.Rollback()
+			http.Error(w, "Cours introuvable ou déjà réalisé", http.StatusConflict)
+			return
+		}
+		if err != nil {
+			tx.Rollback()
+			http.Error(w, "Erreur base de données", http.StatusInternalServerError)
+			return
+		}
+		duration, err := durationMinutes(currentDuration)
+		if err != nil {
+			tx.Rollback()
+			http.Error(w, "Durée du cours invalide", http.StatusInternalServerError)
+			return
+		}
+		conflict, err := hasScheduleConflict(tx, courseID, scheduledAt, duration)
+		if err != nil {
+			tx.Rollback()
+			http.Error(w, "Erreur base de données", http.StatusInternalServerError)
+			return
+		}
+		if conflict {
+			tx.Rollback()
+			http.Error(w, "Impossible de reprogrammer: ce créneau est déjà occupé", http.StatusConflict)
+			return
+		}
+		result, err := tx.Exec(
+			`UPDATE courses
+			 SET scheduled_at = $1
+			 WHERE id = $2
+			   AND status NOT IN ('réalisé', 'realise')`,
+			scheduledAt, courseID,
+		)
+		if err != nil {
+			tx.Rollback()
+			http.Error(w, "Erreur base de données", http.StatusInternalServerError)
+			return
+		}
+		rowsAffected, err := result.RowsAffected()
+		if err != nil {
+			tx.Rollback()
+			http.Error(w, "Erreur base de données", http.StatusInternalServerError)
+			return
+		}
+		if rowsAffected == 0 {
+			tx.Rollback()
+			http.Error(w, "Cours introuvable, déjà passé ou déjà réalisé", http.StatusConflict)
+			return
+		}
+		if err := tx.Commit(); err != nil {
+			http.Error(w, "Erreur base de données", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"message": "Cours reprogrammé"})
 	})
 
 	// WebSocket

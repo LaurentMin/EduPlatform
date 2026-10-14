@@ -15,6 +15,8 @@ export default function CourseList({ isAdmin }: { isAdmin: boolean }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [acceptingCourseId, setAcceptingCourseId] = useState<number | null>(null);
+  const [reschedulingCourseId, setReschedulingCourseId] = useState<number | null>(null);
+  const [newDate, setNewDate] = useState("");
   useEffect(() => {
     const fetchCourses = async () => {
       const token = localStorage.getItem("token");
@@ -33,7 +35,7 @@ export default function CourseList({ isAdmin }: { isAdmin: boolean }) {
         } else {
           setError("Erreur lors de la récupération des cours.");
         }
-      } catch (err) {
+      } catch {
         setError("Serveur injoignable.");
       } finally {
         setLoading(false);
@@ -71,6 +73,41 @@ export default function CourseList({ isAdmin }: { isAdmin: boolean }) {
       setError("Serveur injoignable.");
     } finally {
       setAcceptingCourseId(null);
+    }
+  };
+
+  const rescheduleCourse = async (course: Course) => {
+    const token = localStorage.getItem("token");
+    if (!token || !newDate) return;
+
+    setReschedulingCourseId(course.id);
+    setError("");
+    try {
+      const res = await fetch(`http://localhost:8080/api/courses/${course.id}/reschedule`, {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`
+        },
+        body: JSON.stringify({ date: new Date(newDate).toISOString() })
+      });
+
+      if (!res.ok) {
+        const message = await res.text();
+        setError(message || "Impossible de reprogrammer ce cours.");
+        return;
+      }
+
+      setCourses((previousCourses) =>
+        previousCourses.map((item) =>
+          item.id === course.id ? { ...item, date: new Date(newDate).toISOString() } : item
+        )
+      );
+      setNewDate("");
+    } catch {
+      setError("Serveur injoignable.");
+    } finally {
+      setReschedulingCourseId(null);
     }
   };
 
@@ -133,18 +170,43 @@ export default function CourseList({ isAdmin }: { isAdmin: boolean }) {
                     </td>
                     {isAdmin && (
                       <td className="p-4">
-                        {course.status.toLowerCase().includes("demand") ? (
-                          <button
-                            type="button"
-                            onClick={() => acceptCourse(course.id)}
-                            disabled={acceptingCourseId === course.id}
-                            className="bg-blue-600 hover:bg-blue-500 px-3 py-2 rounded-lg text-sm font-bold disabled:opacity-50"
-                          >
-                            {acceptingCourseId === course.id ? "Acceptation..." : "Accepter"}
-                          </button>
-                        ) : (
-                          <span className="text-gray-500 text-sm">Traitée</span>
-                        )}
+                        <div className="flex flex-col gap-2 min-w-[180px]">
+                          {course.status.toLowerCase().includes("demand") && (
+                            <button
+                              type="button"
+                              onClick={() => acceptCourse(course.id)}
+                              disabled={acceptingCourseId === course.id}
+                              className="bg-blue-600 hover:bg-blue-500 px-3 py-2 rounded-lg text-sm font-bold disabled:opacity-50"
+                            >
+                              {acceptingCourseId === course.id ? "Acceptation..." : "Accepter"}
+                            </button>
+                          )}
+                          {!course.status.toLowerCase().includes("réalisé") &&
+                            !course.status.toLowerCase().includes("realise") && (
+                            <>
+                              <input
+                                type="datetime-local"
+                                value={reschedulingCourseId === course.id ? newDate : ""}
+                                onChange={(event) => {
+                                  setReschedulingCourseId(course.id);
+                                  setNewDate(event.target.value);
+                                }}
+                                className="bg-gray-900 border border-gray-700 rounded-lg px-2 py-2 text-xs text-white"
+                              />
+                              <button
+                                type="button"
+                                onClick={() => rescheduleCourse(course)}
+                                disabled={reschedulingCourseId !== course.id || !newDate}
+                                className="bg-purple-600 hover:bg-purple-500 px-3 py-2 rounded-lg text-sm font-bold disabled:opacity-50"
+                              >
+                                {reschedulingCourseId === course.id ? "Reprogrammer" : "Nouvelle date"}
+                              </button>
+                            </>
+                          )}
+                          {course.status.toLowerCase().includes("réalisé") && (
+                            <span className="text-gray-500 text-sm">Terminée</span>
+                          )}
+                        </div>
                       </td>
                     )}
                   </tr>
